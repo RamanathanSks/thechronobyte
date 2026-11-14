@@ -1,4 +1,4 @@
-"""Generate editorial 1080x1350 (4:5) JPEG news cards for Instagram & Threads."""
+"""Generate editorial 1080x1350 (4:5) JPEG news cards across rotating print themes."""
 
 import hashlib
 import math
@@ -12,36 +12,43 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 CARD_WIDTH = 1080
 CARD_HEIGHT = 1350
 
-PAPER_COLOR = (244, 241, 232)
+PAPER_CREAM = (245, 242, 234)
+PAPER_BUFF = (238, 232, 218)
+NOIR_INK = (19, 21, 25)
 INK_PRIMARY = (20, 22, 24)
-INK_SECONDARY = (50, 53, 56)
-INK_MUTED = (122, 118, 110)
+INK_SECONDARY = (52, 55, 58)
+INK_MUTED = (120, 116, 108)
+LIGHT_PRIMARY = (244, 241, 232)
+LIGHT_SECONDARY = (202, 198, 190)
+LIGHT_MUTED = (142, 140, 134)
 
-# Curated atmospheric color palettes per source: (accent_dot, mist_tint, horizon_dark, primary_wash, warm_bloom).
+CARD_THEMES = ("framed_gallery", "dark_duotone", "riso_poster", "editorial_horizon")
+
+# Per-source curated print palettes: (accent, secondary_wash, deep_ink, warm_highlight).
 SOURCE_PALETTES = {
     "OpenAI": (
-        ((16, 163, 127), (146, 198, 182), (24, 62, 58), (212, 148, 72), (235, 198, 126)),
-        ((16, 163, 127), (154, 188, 194), (30, 52, 74), (88, 152, 138), (228, 182, 108)),
+        ((16, 163, 127), (78, 146, 134), (19, 54, 52), (219, 164, 88)),
+        ((16, 163, 127), (96, 138, 162), (24, 42, 68), (224, 152, 92)),
     ),
     "NVIDIA": (
-        ((102, 168, 0), (168, 196, 142), (28, 56, 26), (168, 178, 74), (226, 208, 120)),
-        ((102, 168, 0), (148, 188, 168), (22, 48, 52), (96, 156, 98), (214, 192, 104)),
+        ((118, 185, 0), (88, 138, 62), (24, 48, 22), (218, 198, 92)),
+        ((118, 185, 0), (66, 128, 118), (18, 42, 46), (198, 178, 84)),
     ),
     "Google AI": (
-        ((56, 118, 228), (156, 186, 218), (28, 46, 86), (214, 138, 68), (236, 198, 124)),
-        ((56, 118, 228), (164, 198, 206), (34, 64, 88), (104, 154, 204), (226, 184, 118)),
+        ((58, 122, 232), (96, 142, 206), (22, 42, 82), (226, 154, 78)),
+        ((58, 122, 232), (82, 156, 152), (24, 54, 68), (224, 168, 96)),
     ),
     "AMD": (
-        ((216, 42, 42), (206, 170, 154), (72, 26, 28), (208, 114, 58), (236, 188, 118)),
-        ((216, 42, 42), (190, 178, 168), (54, 34, 42), (176, 88, 66), (228, 172, 112)),
+        ((220, 44, 48), (188, 92, 62), (62, 22, 26), (232, 168, 86)),
+        ((220, 44, 48), (132, 74, 86), (42, 24, 34), (218, 144, 82)),
     ),
     "Microsoft Research": (
-        ((0, 142, 214), (152, 192, 216), (24, 48, 82), (126, 168, 206), (226, 192, 128)),
-        ((0, 142, 214), (164, 196, 192), (26, 58, 72), (198, 144, 78), (232, 198, 136)),
+        ((0, 146, 218), (74, 132, 188), (20, 44, 78), (224, 174, 98)),
+        ((0, 146, 218), (92, 148, 146), (22, 52, 64), (216, 154, 88)),
     ),
 }
 DEFAULT_PALETTES = (
-    ((78, 92, 208), (166, 186, 212), (32, 42, 74), (196, 136, 74), (232, 194, 126)),
+    ((82, 98, 216), (110, 134, 192), (26, 36, 72), (224, 168, 92)),
 )
 
 FONT_CANDIDATES = {
@@ -185,193 +192,386 @@ def _build_subhead(topic: dict, max_chars: int = 210) -> str:
     return clipped.rstrip(" ,;:-") + "…"
 
 
-def _apply_analog_grain(image: Image.Image, seed: int) -> Image.Image:
-    """Blend crisp tactile analog film/riso grain across the canvas."""
+def _apply_analog_grain(image: Image.Image, strength: float = 0.42) -> Image.Image:
+    """Overlay crisp multi-scale analog print/film grain over an RGB/RGBA image."""
+    w, h = image.size
     base_rgb = image.convert("RGB")
-    fine = Image.effect_noise((CARD_WIDTH, CARD_HEIGHT), 26).convert("RGB")
-    med = Image.effect_noise((CARD_WIDTH // 2, CARD_HEIGHT // 2), 28).resize(
-        (CARD_WIDTH, CARD_HEIGHT), resample=Image.Resampling.BILINEAR
+    fine = Image.effect_noise((w, h), 24).convert("RGB")
+    med = Image.effect_noise((max(1, w // 2), max(1, h // 2)), 26).resize(
+        (w, h), resample=Image.Resampling.BILINEAR
     ).convert("RGB")
-    grain = Image.blend(fine, med, alpha=0.38)
-
-    rng = random.Random(seed)
-    grain_mix = 0.44 + rng.uniform(0.0, 0.06)
+    grain = Image.blend(fine, med, alpha=0.35)
     soft = ImageChops.soft_light(base_rgb, grain)
-    return Image.blend(base_rgb, soft, alpha=grain_mix).convert("RGBA")
+    return Image.blend(base_rgb, soft, alpha=strength).convert("RGBA")
 
 
-def _build_wave(
-    base_y: float,
-    amp: float,
-    freq: float,
-    phase: float,
-    slope: float,
-    offset_jitter: list[float] | None = None,
-) -> list[tuple[int, int]]:
-    """Build smooth organic horizon contour points across the full card width."""
-    pts: list[tuple[int, int]] = []
-    step = 20
-    for idx, x in enumerate(range(0, CARD_WIDTH + step, step)):
-        cx = min(x, CARD_WIDTH)
-        t = cx / CARD_WIDTH
-        y = (
-            base_y
-            + slope * (cx - CARD_WIDTH / 2)
-            + amp * math.sin(t * math.pi * freq + phase)
-            + (amp * 0.38) * math.cos(t * math.pi * (freq * 2.1) - phase * 0.7)
-        )
-        if offset_jitter and idx < len(offset_jitter):
-            y += offset_jitter[idx]
-        pts.append((cx, int(y)))
-    return pts
+def _draw_masthead(
+    draw: ImageDraw.ImageDraw,
+    topic: dict,
+    handle: str,
+    accent: tuple[int, int, int],
+    primary_fill: tuple[int, int, int, int],
+    muted_fill: tuple[int, int, int, int],
+    rule_fill: tuple[int, int, int, int] | None = None,
+) -> None:
+    """Draw the minimal Chrono Byte editorial masthead bar across the top."""
+    font_bold = _load_font("semibold", 18)
+    font_reg = _load_font("regular", 18)
+    margin_x = 76
+    top_y = 54
+
+    draw.rounded_rectangle((margin_x, top_y + 4, margin_x + 12, top_y + 16), radius=3, fill=(*accent, 255))
+    brand = "CHRONO BYTE"
+    draw.text((margin_x + 22, top_y), brand, font=font_bold, fill=primary_fill)
+    brand_w = _text_width(draw, brand, font_bold)
+    draw.text((margin_x + 28 + brand_w, top_y), f" ·  {handle}", font=font_reg, fill=muted_fill)
+
+    source = _strip_invisible(topic.get("source", "Tech News")).upper()
+    date_label = topic["published"].strftime("%b %d, %Y").upper().replace(" 0", " ")
+    meta = f"{source}  ·  {date_label}"
+    meta_w = _text_width(draw, meta, font_reg)
+    draw.text((CARD_WIDTH - margin_x - meta_w, top_y), meta, font=font_reg, fill=muted_fill)
+    if rule_fill is not None:
+        draw.line((margin_x, 102, CARD_WIDTH - margin_x, 102), fill=rule_fill, width=1)
 
 
-def _draw_editorial_background(
-    palette: tuple[tuple[int, int, int], ...],
-    seed: int,
-) -> Image.Image:
-    """Create warm archival paper top fading into organic painterly horizon art."""
-    _, mist, horizon_dark, wash, bloom = palette
-    rng = random.Random(seed)
-
-    base = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (*PAPER_COLOR, 255))
-
-    # 1. Soft atmospheric mist sweeping diagonally from lower right or lower left behind text.
-    mist_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
-    mist_draw = ImageDraw.Draw(mist_layer)
-    mist_x = rng.randint(640, 960) if seed % 2 == 0 else rng.randint(80, 420)
-    mist_draw.ellipse((mist_x - 520, 440, mist_x + 560, 1080), fill=(*mist, 138))
-    mist_layer = mist_layer.filter(ImageFilter.GaussianBlur(radius=165))
-    base = Image.alpha_composite(base, mist_layer)
-
-    # 2. Painterly layered horizontal wave washes (organic sweep, no obvious circles).
-    horizon_y = rng.randint(768, 808)
-    phase = rng.uniform(0.0, math.tau)
-    amp = rng.uniform(9.0, 18.0)
-    slope = rng.uniform(-0.02, 0.02)
-    wave_main = _build_wave(horizon_y, amp, 1.35, phase, slope)
-    wave_mid = _build_wave(horizon_y + 165, amp * 1.6, 1.15, phase + 1.1, -slope * 0.8)
-    wave_low = _build_wave(horizon_y + 340, amp * 1.4, 1.6, phase + 2.3, slope * 1.1)
-
-    art_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
-    art_draw = ImageDraw.Draw(art_layer)
-
-    # Primary rich pigment base below the horizon.
-    art_draw.polygon(wave_main + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*wash, 240))
-    # Sweeping mineral / sunlit secondary wash across lower region.
-    art_draw.polygon(wave_mid + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*bloom, 205))
-    # Warm sunlit fade near bottom edge.
-    light_paper = (
-        min(255, int(bloom[0] * 0.45 + PAPER_COLOR[0] * 0.55)),
-        min(255, int(bloom[1] * 0.45 + PAPER_COLOR[1] * 0.55)),
-        min(255, int(bloom[2] * 0.45 + PAPER_COLOR[2] * 0.55)),
-    )
-    art_draw.polygon(wave_low + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*light_paper, 175))
-
-    # Deep organic pigment ridge right along the horizon transition.
-    ridge_band = [(x, y - 6) for x, y in wave_main] + [(x, y + 72) for x, y in reversed(wave_main)]
-    art_draw.polygon(ridge_band, fill=(*horizon_dark, 232))
-    art_layer = art_layer.filter(ImageFilter.GaussianBlur(radius=48))
-    base = Image.alpha_composite(base, art_layer)
-
-    # 3. Tactile horizon stipple edge: subtly textured pigment band along the wave crest.
-    jitter = [rng.uniform(-4.5, 4.5) for _ in range(len(wave_main))]
-    crest_wave = _build_wave(horizon_y + 4, amp, 1.35, phase, slope, offset_jitter=jitter)
-    crest_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
-    crest_draw = ImageDraw.Draw(crest_layer)
-    crest_draw.line([(x, y - 16) for x, y in crest_wave], fill=(*mist, 130), width=22)
-    crest_draw.line(crest_wave, fill=(*horizon_dark, 175), width=20)
-    crest_layer = crest_layer.filter(ImageFilter.GaussianBlur(radius=11))
-    base = Image.alpha_composite(base, crest_layer)
-
-    return _apply_analog_grain(base, seed)
-
-
-def _draw_centered_lines(
+def _draw_text_lines(
     draw: ImageDraw.ImageDraw,
     lines: list[str],
+    x: int,
     start_y: int,
     line_step: int,
     font: ImageFont.ImageFont,
     fill: tuple[int, int, int, int],
+    centered: bool = False,
 ) -> int:
-    """Draw horizontally centered lines and return the ending y-coordinate."""
+    """Draw left-aligned or centered lines and return the ending y-coordinate."""
     y = start_y
     for line in lines:
-        w = _text_width(draw, line, font)
-        draw.text(((CARD_WIDTH - w) / 2, y), line, font=font, fill=fill)
+        draw_x = (CARD_WIDTH - _text_width(draw, line, font)) / 2 if centered else float(x)
+        draw.text((draw_x, y), line, font=font, fill=fill)
         y += line_step
     return y
 
 
-def render_news_card(topic: dict, output_path: str | Path, handle: str = "@thechronobyte") -> Path:
-    """Render a 1080x1350 editorial JPEG card with paper top + textured horizon art."""
+def _fit_headline_lines(
+    draw: ImageDraw.ImageDraw,
+    headline: str,
+    width: int,
+    base_size: int,
+    small_size: int,
+    font_weight: str = "serif",
+) -> tuple[list[str], ImageFont.ImageFont]:
+    font = _load_font(font_weight, base_size)
+    lines = _wrap_text(draw, headline, font, width, max_lines=4)
+    if len(lines) >= 4:
+        font = _load_font(font_weight, small_size)
+        lines = _wrap_text(draw, headline, font, width, max_lines=4)
+    return lines, font
+
+
+def _render_framed_gallery(
+    topic: dict,
+    palette: tuple[tuple[int, int, int], ...],
+    seed: int,
+    handle: str,
+) -> Image.Image:
+    """Architectural magazine cover: crisp left editorial copy over a framed art plate."""
+    accent, wash, deep, highlight = palette
+    rng = random.Random(seed)
+
+    canvas = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (*PAPER_CREAM, 255))
+    draw = ImageDraw.Draw(canvas)
+    _draw_masthead(
+        draw, topic, handle, accent, (*INK_SECONDARY, 235), (*INK_MUTED, 235), rule_fill=(20, 22, 24, 28)
+    )
+
+    margin_x = 76
+    content_w = CARD_WIDTH - margin_x * 2
+    headline = _strip_invisible(topic["text"])
+    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 64, 54, font_weight="serif_bold")
+    h_step = int(h_font.size * 1.14)
+    h_end = _draw_text_lines(draw, h_lines, margin_x, 146, h_step, h_font, (*INK_PRIMARY, 255))
+
+    # Accent hairline rule separating headline & lead.
+    rule_y = h_end + 22
+    draw.rectangle((margin_x, rule_y, margin_x + 76, rule_y + 4), fill=(*accent, 255))
+
+    subhead = _build_subhead(topic, max_chars=215)
+    body_font = _load_font("regular", 30)
+    b_lines = _wrap_text(draw, subhead, body_font, content_w - 40, max_lines=4) if subhead else []
+    body_end = _draw_text_lines(draw, b_lines, margin_x, rule_y + 26, 42, body_font, (*INK_SECONDARY, 240))
+
+    # Lower framed artwork plate.
+    plate_top = max(620, body_end + 44)
+    plate_bottom = CARD_HEIGHT - 74
+    plate_w = content_w
+    plate_h = plate_bottom - plate_top
+
+    plate = Image.new("RGBA", (plate_w, plate_h), (*deep, 255))
+    art = Image.new("RGBA", (plate_w, plate_h), (0, 0, 0, 0))
+    ad = ImageDraw.Draw(art)
+
+    # Flowing geometric wave + atmospheric pigment wash inside the framed window.
+    shift = rng.uniform(0.0, math.tau)
+    wave_pts = [
+        (
+            x,
+            int(
+                plate_h * 0.45
+                + 58 * math.sin((x / plate_w) * math.pi * 1.6 + shift)
+                + 24 * math.cos((x / plate_w) * math.pi * 3.1 - shift)
+            ),
+        )
+        for x in range(0, plate_w + 20, 20)
+    ]
+    ad.polygon(wave_pts + [(plate_w, plate_h), (0, plate_h)], fill=(*wash, 230))
+    ad.ellipse(
+        (rng.randint(80, 420), int(plate_h * 0.18), rng.randint(680, 960), plate_h + 180),
+        fill=(*highlight, 170),
+    )
+    ad.ellipse((-120, -140, int(plate_w * 0.55), int(plate_h * 0.65)), fill=(*accent, 110))
+    art = art.filter(ImageFilter.GaussianBlur(radius=58))
+    plate = Image.alpha_composite(plate, art)
+
+    # Crisp architectural linework subtly etched inside the framed artwork.
+    line_layer = Image.new("RGBA", (plate_w, plate_h), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(line_layer)
+    cx = int(plate_w * rng.uniform(0.62, 0.84))
+    cy = int(plate_h * rng.uniform(0.32, 0.62))
+    for radius in (130, 210, 290, 370):
+        ld.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=(255, 255, 255, 42), width=2)
+    plate = Image.alpha_composite(plate, line_layer)
+    plate = _apply_analog_grain(plate, strength=0.38)
+
+    # Round mask for clean editorial print corners.
+    mask = Image.new("L", (plate_w, plate_h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, plate_w, plate_h), radius=18, fill=255)
+    canvas.paste(plate, (margin_x, plate_top), mask)
+    return _apply_analog_grain(canvas, strength=0.16)
+
+
+def _render_dark_duotone(
+    topic: dict,
+    palette: tuple[tuple[int, int, int], ...],
+    seed: int,
+    handle: str,
+) -> Image.Image:
+    """Midnight print poster: dark charcoal surface, ivory serif, duotone ribbon glow."""
+    accent, wash, _, highlight = palette
+    rng = random.Random(seed)
+
+    canvas = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (*NOIR_INK, 255))
+    glow = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+
+    # Dramatic sweeping diagonal duotone bands in bottom/right region.
+    anchor_x = rng.randint(360, 840)
+    gd.ellipse((anchor_x - 520, 640, anchor_x + 540, 1480), fill=(*wash, 185))
+    gd.ellipse((rng.randint(-180, 240), 860, rng.randint(520, 880), 1560), fill=(*accent, 145))
+    gd.ellipse((rng.randint(240, 680), 960, 1180, 1520), fill=(*highlight, 130))
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=125))
+    canvas = Image.alpha_composite(canvas, glow)
+
+    # Fine editorial hairline frame + masthead.
+    chrome = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(chrome)
+    cd.rounded_rectangle((36, 32, CARD_WIDTH - 36, CARD_HEIGHT - 32), radius=12, outline=(255, 255, 255, 26), width=2)
+    _draw_masthead(
+        cd, topic, handle, accent, (*LIGHT_PRIMARY, 235), (*LIGHT_MUTED, 235), rule_fill=(255, 255, 255, 28)
+    )
+    canvas = Image.alpha_composite(canvas, chrome)
+    draw = ImageDraw.Draw(canvas)
+
+    margin_x = 84
+    content_w = CARD_WIDTH - margin_x * 2
+    topic_tag = _strip_invisible(topic.get("topic_tag") or "").upper()
+    tag_font = _load_font("semibold", 20)
+    y_cursor = 178
+    if topic_tag:
+        draw.text((margin_x, y_cursor), topic_tag, font=tag_font, fill=(*accent, 255))
+        y_cursor += 48
+
+    headline = _strip_invisible(topic["text"])
+    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 68, 56, font_weight="serif")
+    h_step = int(h_font.size * 1.14)
+    h_end = _draw_text_lines(draw, h_lines, margin_x, y_cursor, h_step, h_font, (*LIGHT_PRIMARY, 255))
+
+    subhead = _build_subhead(topic, max_chars=220)
+    body_font = _load_font("regular", 32)
+    b_lines = _wrap_text(draw, subhead, body_font, content_w - 60, max_lines=4) if subhead else []
+    _draw_text_lines(draw, b_lines, margin_x, h_end + 36, 45, body_font, (*LIGHT_SECONDARY, 240))
+
+    return _apply_analog_grain(canvas, strength=0.34)
+
+
+def _multiply_ink_shape(canvas_rgb: Image.Image, draw_fn, blur_radius: float = 1.5) -> Image.Image:
+    """Stamp one translucent risograph ink pass using physical multiply blending."""
+    ink = Image.new("RGB", canvas_rgb.size, (255, 255, 255))
+    draw_fn(ImageDraw.Draw(ink))
+    if blur_radius > 0:
+        ink = ink.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    return ImageChops.multiply(canvas_rgb, ink)
+
+
+def _render_riso_poster(
+    topic: dict,
+    palette: tuple[tuple[int, int, int], ...],
+    seed: int,
+    handle: str,
+) -> Image.Image:
+    """Mid-century Swiss / Riso print: sandstone paper + multiplied geometric ink passes."""
+    accent, wash, deep, highlight = palette
+    rng = random.Random(seed)
+    soft_accent = tuple(int(c * 0.72 + PAPER_BUFF[i] * 0.28) for i, c in enumerate(accent))
+
+    paper_rgb = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT), PAPER_BUFF)
+    variant = seed % 2
+    if variant == 0:
+        paper_rgb = _multiply_ink_shape(
+            paper_rgb, lambda d: d.pieslice((-60, 680, 780, 1520), start=180, end=360, fill=highlight)
+        )
+        paper_rgb = _multiply_ink_shape(
+            paper_rgb, lambda d: d.ellipse((420, 700, 1220, 1500), fill=wash)
+        )
+        paper_rgb = _multiply_ink_shape(
+            paper_rgb, lambda d: d.rounded_rectangle((76, 1020, 620, 1280), radius=12, fill=deep)
+        )
+    else:
+        paper_rgb = _multiply_ink_shape(
+            paper_rgb, lambda d: d.rounded_rectangle((76, 700, 1004, 1276), radius=250, fill=wash)
+        )
+        paper_rgb = _multiply_ink_shape(
+            paper_rgb, lambda d: d.ellipse((500, 650, 1180, 1330), fill=highlight)
+        )
+        paper_rgb = _multiply_ink_shape(
+            paper_rgb, lambda d: d.ellipse((-120, 820, 560, 1500), fill=soft_accent)
+        )
+
+    canvas = paper_rgb.convert("RGBA")
+    draw = ImageDraw.Draw(canvas)
+
+    _draw_masthead(draw, topic, handle, accent, (*INK_SECONDARY, 235), (*INK_MUTED, 235))
+    margin_x = 76
+    content_w = CARD_WIDTH - margin_x * 2
+
+    # Crisp Swiss rule + editorial section eyebrow above the headline.
+    draw.line((margin_x, 108, CARD_WIDTH - margin_x, 108), fill=(*INK_PRIMARY, 185), width=3)
+    stamp_font = _load_font("semibold", 18)
+    topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "AI BRIEF").upper()
+    draw.text((margin_x, 140), f"FOCUS  /  {topic_tag}", font=stamp_font, fill=(*INK_MUTED, 245))
+
+    headline = _strip_invisible(topic["text"])
+    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 66, 56, font_weight="serif_bold")
+    h_step = int(h_font.size * 1.13)
+    h_end = _draw_text_lines(draw, h_lines, margin_x, 184, h_step, h_font, (*INK_PRIMARY, 255))
+
+    subhead = _build_subhead(topic, max_chars=210)
+    body_font = _load_font("regular", 30)
+    b_lines = _wrap_text(draw, subhead, body_font, content_w - 60, max_lines=4) if subhead else []
+    _draw_text_lines(draw, b_lines, margin_x, h_end + 28, 42, body_font, (*INK_SECONDARY, 240))
+
+    return _apply_analog_grain(canvas, strength=0.45 + rng.uniform(0.0, 0.04))
+
+
+def _render_editorial_horizon(
+    topic: dict,
+    palette: tuple[tuple[int, int, int], ...],
+    seed: int,
+    handle: str,
+) -> Image.Image:
+    """Warm archival paper top centered copy fading into an organic grainy horizon."""
+    accent, wash, deep, highlight = palette
+    rng = random.Random(seed)
+    mist = (
+        int(wash[0] * 0.45 + PAPER_CREAM[0] * 0.55),
+        int(wash[1] * 0.45 + PAPER_CREAM[1] * 0.55),
+        int(wash[2] * 0.45 + PAPER_CREAM[2] * 0.55),
+    )
+
+    base = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (*PAPER_CREAM, 255))
+    mist_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    mist_x = rng.randint(620, 960) if seed % 2 == 0 else rng.randint(80, 420)
+    ImageDraw.Draw(mist_layer).ellipse((mist_x - 520, 440, mist_x + 560, 1080), fill=(*mist, 150))
+    base = Image.alpha_composite(base, mist_layer.filter(ImageFilter.GaussianBlur(radius=160)))
+
+    horizon_y = rng.randint(770, 810)
+    phase = rng.uniform(0.0, math.tau)
+    amp = rng.uniform(9.0, 18.0)
+    slope = rng.uniform(-0.02, 0.02)
+
+    def wave(by: float, a: float, f: float, p: float, s: float) -> list[tuple[int, int]]:
+        return [
+            (
+                min(x, CARD_WIDTH),
+                int(
+                    by
+                    + s * (min(x, CARD_WIDTH) - CARD_WIDTH / 2)
+                    + a * math.sin((min(x, CARD_WIDTH) / CARD_WIDTH) * math.pi * f + p)
+                ),
+            )
+            for x in range(0, CARD_WIDTH + 20, 20)
+        ]
+
+    wave_main = wave(horizon_y, amp, 1.35, phase, slope)
+    wave_low = wave(horizon_y + 185, amp * 1.5, 1.15, phase + 1.1, -slope * 0.8)
+
+    art = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    ad = ImageDraw.Draw(art)
+    ad.polygon(wave_main + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*wash, 240))
+    ad.polygon(wave_low + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*highlight, 205))
+    ad.polygon(
+        [(x, y - 6) for x, y in wave_main] + [(x, y + 66) for x, y in reversed(wave_main)],
+        fill=(*deep, 232),
+    )
+    base = Image.alpha_composite(base, art.filter(ImageFilter.GaussianBlur(radius=46)))
+
+    crest = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    ImageDraw.Draw(crest).line(wave_main, fill=(*deep, 175), width=18)
+    base = Image.alpha_composite(base, crest.filter(ImageFilter.GaussianBlur(radius=10)))
+    canvas = _apply_analog_grain(base, strength=0.44)
+    draw = ImageDraw.Draw(canvas)
+
+    _draw_masthead(draw, topic, handle, accent, (*INK_SECONDARY, 235), (*INK_MUTED, 235))
+    headline = _strip_invisible(topic["text"])
+    h_lines, h_font = _fit_headline_lines(draw, headline, 820, 68, 58, font_weight="serif")
+    h_step = int(h_font.size * 1.13)
+
+    subhead = _build_subhead(topic)
+    body_font = _load_font("regular", 30)
+    b_lines = _wrap_text(draw, subhead, body_font, 760, max_lines=4) if subhead else []
+    gap = 32 if b_lines else 0
+    block_h = len(h_lines) * h_step + gap + len(b_lines) * 42
+    start_y = max(148, 148 + (720 - 148 - block_h) // 2)
+
+    h_end = _draw_text_lines(draw, h_lines, 0, start_y, h_step, h_font, (*INK_PRIMARY, 255), centered=True)
+    if b_lines:
+        _draw_text_lines(draw, b_lines, 0, h_end + gap, 42, body_font, (*INK_SECONDARY, 245), centered=True)
+    return canvas
+
+
+_THEME_RENDERERS = {
+    "framed_gallery": _render_framed_gallery,
+    "dark_duotone": _render_dark_duotone,
+    "riso_poster": _render_riso_poster,
+    "editorial_horizon": _render_editorial_horizon,
+}
+
+
+def render_news_card(
+    topic: dict,
+    output_path: str | Path,
+    handle: str = "@thechronobyte",
+    theme: str | None = None,
+) -> Path:
+    """Render a 1080x1350 editorial JPEG card using one of four rotating print themes."""
     source = _strip_invisible(topic.get("source", "Tech News"))
-    headline_text = _strip_invisible(topic["text"])
     seed = _topic_seed(topic)
     palettes = SOURCE_PALETTES.get(source, DEFAULT_PALETTES)
     palette = palettes[seed % len(palettes)]
-    accent = palette[0]
 
-    canvas = _draw_editorial_background(palette, seed)
-    draw = ImageDraw.Draw(canvas)
-
-    font_header_bold = _load_font("semibold", 19)
-    font_header = _load_font("regular", 19)
-    font_headline = _load_font("serif", 68)
-    font_body = _load_font("regular", 30)
-
-    # Subtle minimal top masthead so the headline & subhead remain the centerpiece.
-    margin_x = 76
-    top_y = 54
-    draw.rounded_rectangle((margin_x, top_y + 5, margin_x + 12, top_y + 17), radius=3, fill=(*accent, 255))
-    brand_label = "CHRONO BYTE"
-    draw.text((margin_x + 22, top_y), brand_label, font=font_header_bold, fill=(*INK_SECONDARY, 235))
-    brand_w = _text_width(draw, brand_label, font_header_bold)
-    draw.text((margin_x + 28 + brand_w, top_y), f" ·  {handle}", font=font_header, fill=(*INK_MUTED, 235))
-
-    published = topic["published"]
-    date_label = published.strftime("%b %d, %Y").upper().replace(" 0", " ")
-    meta_label = f"{source.upper()}  ·  {date_label}"
-    meta_w = _text_width(draw, meta_label, font_header)
-    draw.text((CARD_WIDTH - margin_x - meta_w, top_y), meta_label, font=font_header, fill=(*INK_MUTED, 235))
-
-    # Measure centered editorial headline + subhead inside the upper paper region.
-    headline_width = 820
-    headline_lines = _wrap_text(draw, headline_text, font_headline, headline_width, max_lines=4)
-    if len(headline_lines) >= 4:
-        font_headline = _load_font("serif", 58)
-        headline_lines = _wrap_text(draw, headline_text, font_headline, headline_width, max_lines=4)
-    headline_step = int(font_headline.size * 1.13)
-
-    subhead_text = _build_subhead(topic)
-    body_width = 760
-    body_step = 42
-    body_lines = _wrap_text(draw, subhead_text, font_body, body_width, max_lines=4) if subhead_text else []
-
-    gap = 32 if body_lines else 0
-    block_height = len(headline_lines) * headline_step + gap + len(body_lines) * body_step
-    zone_top = 148
-    zone_bottom = 720
-    start_y = max(zone_top, zone_top + (zone_bottom - zone_top - block_height) // 2)
-
-    after_headline_y = _draw_centered_lines(
-        draw,
-        headline_lines,
-        start_y,
-        headline_step,
-        font_headline,
-        (*INK_PRIMARY, 255),
-    )
-    if body_lines:
-        _draw_centered_lines(
-            draw,
-            body_lines,
-            after_headline_y + gap,
-            body_step,
-            font_body,
-            (*INK_SECONDARY, 245),
-        )
+    chosen_theme = theme if theme in _THEME_RENDERERS else CARD_THEMES[seed % len(CARD_THEMES)]
+    canvas = _THEME_RENDERERS[chosen_theme](topic, palette, seed, handle)
 
     dest = Path(output_path)
     dest.parent.mkdir(parents=True, exist_ok=True)

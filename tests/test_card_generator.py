@@ -34,6 +34,17 @@ class CardGeneratorTests(unittest.TestCase):
                 self.assertEqual(img.size, (1080, 1350))
                 self.assertEqual(img.mode, "RGB")
 
+    def test_all_card_themes_render_distinct_valid_jpegs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sizes = []
+            for theme in cg.CARD_THEMES:
+                out = cg.render_news_card(self.topic, Path(tmpdir) / f"{theme}.jpg", theme=theme)
+                with Image.open(out) as img:
+                    self.assertEqual(img.size, (1080, 1350))
+                    self.assertEqual(img.mode, "RGB")
+                sizes.append(out.read_bytes())
+            self.assertEqual(len(set(sizes)), len(cg.CARD_THEMES))
+
     def test_handles_very_long_headlines_and_paragraphs_without_error(self):
         long_topic = {
             **self.topic,
