@@ -55,7 +55,7 @@ GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 THREADS_API_BASE = "https://graph.threads.net/v1.0"
 THREADS_REFRESH_URL = "https://graph.threads.net/refresh_access_token"
-INSTAGRAM_API_BASE = "https://graph.instagram.com/v22.0"
+INSTAGRAM_API_BASE = "https://graph.facebook.com/v22.0"
 INSTAGRAM_REFRESH_URL = "https://graph.instagram.com/refresh_access_token"
 IMGBB_UPLOAD_URL = "https://api.imgbb.com/1/upload"
 GITHUB_API_BASE = "https://api.github.com"
@@ -1007,7 +1007,7 @@ def _resolve_card_image_url(card_path: Path) -> str:
 
 
 def post_to_instagram(image_url: str, caption: str) -> str:
-    """Publish a JPEG photo post via Instagram API with Instagram Login (graph.instagram.com)."""
+    """Publish a JPEG photo post via Meta Instagram Graph API (Unified Login / graph.facebook.com)."""
     if not image_url.startswith("https://"):
         raise ValueError("Instagram image_url must be a public HTTPS URL.")
     if not caption.strip() or _post_weight(caption) > MAX_IG_CAPTION_LENGTH:
