@@ -2,9 +2,11 @@
 
 import json
 import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from pathlib import Path
 from unittest.mock import patch
 from xml.sax.saxutils import escape
 
@@ -499,6 +501,72 @@ class DailyThreadsPostTests(unittest.TestCase):
         self.assertNotIn("test-threads-token", combined)
         self.assertIn("401", combined)
         self.assertIn("code=190", combined)
+
+    def test_instagram_caption_template_has_hook_cta_hashtags_and_no_raw_urls(self):
+        caption = bot.generate_instagram_caption(self.topic)
+        first_line = caption.splitlines()[0]
+        self.assertLessEqual(len(first_line), 125)
+        self.assertIn("@thechronobyte", caption)
+        self.assertIn("link in bio", caption.lower())
+        self.assertIn("#NVIDIA", caption)
+        self.assertIn("#TheChronoByte", caption)
+        self.assertNotIn("https://", caption)
+        self.assertLessEqual(len(caption), bot.MAX_IG_CAPTION_LENGTH)
+
+    def test_instagram_caption_groq_validation_and_fallback(self):
+        os.environ["GROQ_API_KEY"] = "test-groq-key"
+        valid_groq = self.response({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": (
+                        "⚡ NVIDIA just changed the math for local AI workloads.\n\n"
+                        "**Throughput doubled** while cutting rack power across training clusters.\n\n"
+                        "Would you run this on-prem or in the cloud?"
+                    ),
+                },
+            }]
+        })
+        with patch.object(bot.requests, "post", return_value=valid_groq):
+            caption = bot.generate_instagram_caption(self.topic)
+        self.assertIn("Throughput doubled while cutting rack power", caption)
+        self.assertNotIn("**", caption)
+        self.assertIn("@thechronobyte", caption)
+        self.assertIn("#NVIDIA", caption)
+
+        bad_groq = self.response({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "Check https://blogs.nvidia.com/bad-link for more #spam"},
+            }]
+        })
+        with (
+            patch.object(bot.requests, "post", return_value=bad_groq),
+            self.assertLogs(bot.LOGGER, level="WARNING") as logs,
+        ):
+            fallback = bot.generate_instagram_caption(self.topic)
+        self.assertNotIn("https://", fallback)
+        self.assertIn("@thechronobyte", fallback)
+        self.assertIn("using the template", " ".join(logs.output))
+
+    def test_main_save_card_writes_image_and_caption_without_posting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            card_path = Path(tmpdir) / "card.jpg"
+            with (
+                patch.object(bot, "get_topic_of_the_day", return_value=self.topic),
+                patch.object(bot, "publish_thread") as post,
+                self.assertLogs(bot.LOGGER, level="INFO") as logs,
+            ):
+                rc = bot.main(["--save-card", str(card_path)])
+            self.assertEqual(rc, 0)
+            post.assert_not_called()
+            self.assertTrue(card_path.is_file())
+            caption_path = card_path.with_suffix(".caption.txt")
+            self.assertTrue(caption_path.is_file())
+            caption_text = caption_path.read_text(encoding="utf-8")
+            self.assertIn("@thechronobyte", caption_text)
+            self.assertIn("#NVIDIA", caption_text)
+            self.assertIn("Instagram Caption Preview", " ".join(logs.output))
 
 
 if __name__ == "__main__":
