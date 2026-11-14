@@ -747,6 +747,66 @@ class DailyThreadsPostTests(unittest.TestCase):
         self.assertIn("https://www.instagram.com/p/TEST123/", combined)
         self.assertNotIn("secret-ig-tok", combined)
 
+    def test_post_instagram_carousel_publishes_children_and_parent(self):
+        os.environ["IG_USER_ID"] = "17841400001234"
+        os.environ["IG_ACCESS_TOKEN"] = "secret-ig-tok"
+        urls = [
+            "https://cdn.example.com/s1.jpg",
+            "https://cdn.example.com/s2.jpg",
+            "https://cdn.example.com/s3.jpg",
+        ]
+        post_resps = [
+            self.response({"id": "child-1"}),
+            self.response({"id": "child-2"}),
+            self.response({"id": "child-3"}),
+            self.response({"id": "parent-c"}),
+            self.response({"id": "carousel-m-1"}),
+        ]
+        with (
+            patch.object(bot.requests, "post", side_effect=post_resps) as post,
+            patch.object(bot.requests, "get", return_value=self.response({"status_code": "FINISHED"})),
+        ):
+            media_id = bot.post_instagram_carousel(urls, "Multi-card breakdown #TheChronoByte")
+        self.assertEqual(media_id, "carousel-m-1")
+        self.assertEqual(post.call_count, 5)
+        self.assertEqual(post.call_args_list[0].kwargs["data"]["is_carousel_item"], "true")
+        self.assertEqual(post.call_args_list[3].kwargs["data"]["media_type"], "CAROUSEL")
+        self.assertEqual(post.call_args_list[3].kwargs["data"]["children"], "child-1,child-2,child-3")
+        self.assertEqual(post.call_args_list[4].kwargs["data"]["creation_id"], "parent-c")
+
+    def test_publish_instagram_card_uploads_and_publishes_multi_slide_carousel(self):
+        os.environ.update({
+            "IG_USER_ID": "17841400001234",
+            "IG_ACCESS_TOKEN": "secret-ig-tok",
+            "IMGBB_API_KEY": "secret-imgbb-key",
+        })
+        rich_topic = {
+            **self.topic,
+            "paragraphs": [
+                f"Paragraph {i}: Detailed AI hardware architecture benchmarks, memory bandwidth scaling, and power efficiency metrics across data center clusters."
+                for i in range(1, 8)
+            ],
+        }
+        with (
+            patch.object(
+                bot,
+                "_upload_to_imgbb",
+                side_effect=lambda p, _: f"https://i.ibb.co/demo/{p.name}",
+            ) as upload,
+            patch.object(bot, "post_instagram_carousel", return_value="ig-car-99") as pub,
+            patch.object(
+                bot.requests,
+                "get",
+                return_value=self.response({"id": "ig-car-99", "permalink": "https://www.instagram.com/p/CAROUSEL/"}),
+            ),
+        ):
+            media_id = bot.publish_instagram_card(rich_topic, "Deep dive caption #TheChronoByte")
+        self.assertEqual(media_id, "ig-car-99")
+        self.assertGreaterEqual(upload.call_count, 3)
+        uploaded_urls = pub.call_args.args[0]
+        self.assertGreaterEqual(len(uploaded_urls), 3)
+        self.assertTrue(all(u.startswith("https://i.ibb.co/demo/") for u in uploaded_urls))
+
 
 if __name__ == "__main__":
     unittest.main()

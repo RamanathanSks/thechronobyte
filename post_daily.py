@@ -62,8 +62,9 @@ GITHUB_API_BASE = "https://api.github.com"
 IG_MEDIA_BRANCH = "ig-media"
 MAX_POST_LENGTH = 500  # Threads text limit (checked conservatively in UTF-8 bytes).
 MAX_IG_CAPTION_LENGTH = 2200  # Instagram Graph API caption limit.
-IG_BODY_TARGET_LENGTH = 1400  # Keep mobile captions punchy before CTA + hashtags.
-MAX_ARTICLE_BYTES = 350_000
+IG_BODY_TARGET_LENGTH = 1750  # Rich multi-paragraph mobile caption before CTA + hashtags.
+MAX_ARTICLE_BYTES = 750_000
+MAX_CAROUSEL_SLIDES = 6
 HTTP_TIMEOUT = (5, 20)  # Connect and read timeouts, in seconds.
 URL_PATTERN = re.compile(r"https?://\S+|\b(?:[\w-]+\.)+[a-z]{2,}(?:/\S*)?", re.I)
 USER_ID_PATTERN = re.compile(r"^(?:me|\d{1,30})$")
@@ -174,14 +175,15 @@ class _HTMLTextExtractor(HTMLParser):
 
 
 class _ArticleParagraphExtractor(HTMLParser):
-    """Extract main <p> paragraphs from official article HTML, skipping chrome."""
+    """Extract main <p> and substantial <li> content blocks from article HTML, skipping chrome."""
 
-    _SKIP_TAGS = frozenset({"script", "style", "nav", "header", "footer", "aside", "noscript", "form"})
+    _SKIP_TAGS = frozenset({"script", "style", "nav", "header", "footer", "aside", "noscript", "form", "svg", "iframe"})
+    _BLOCK_TAGS = frozenset({"p", "li"})
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._skip_depth = 0
-        self._in_p = False
+        self._active_tag: str | None = None
         self._current: list[str] = []
         self.paragraphs: list[str] = []
 
@@ -189,28 +191,30 @@ class _ArticleParagraphExtractor(HTMLParser):
         lowered = tag.lower()
         if lowered in self._SKIP_TAGS:
             self._skip_depth += 1
-        elif lowered == "p" and self._skip_depth == 0:
-            self._in_p = True
+        elif lowered in self._BLOCK_TAGS and self._skip_depth == 0 and self._active_tag is None:
+            self._active_tag = lowered
             self._current = []
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
         if lowered in self._SKIP_TAGS and self._skip_depth > 0:
             self._skip_depth -= 1
-        elif lowered == "p" and self._in_p:
-            self._in_p = False
+        elif lowered == self._active_tag:
+            min_len = 60 if lowered == "li" else 50
+            self._active_tag = None
             text = _clean_text(unescape("".join(self._current)))
-            if len(text) >= 50 and not BOILERPLATE_PATTERN.search(text):
+            if len(text) >= min_len and not BOILERPLATE_PATTERN.search(text):
                 self.paragraphs.append(text)
 
     def handle_data(self, data: str) -> None:
-        if self._in_p and self._skip_depth == 0:
+        if self._active_tag and self._skip_depth == 0:
             self._current.append(data)
 
 
 def _clean_text(text: str) -> str:
-    """Normalize whitespace/Unicode and drop surrogates or invisible format characters."""
+    """Normalize whitespace/Unicode and strip invisible format chars or link-hint artifacts."""
     text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"\s*\(\s*opens in a new (?:window|tab)\s*\)", "", text, flags=re.I)
     text = "".join(
         char for char in text
         if char not in "\ufeff\ufffe\uffff" and unicodedata.category(char) not in {"Cs", "Cf"}
@@ -271,6 +275,14 @@ def _story_seed(topic: dict) -> int:
     """Deterministic per-story hash so formatting varies cleanly across stories/days."""
     key = f"{topic['published']:%Y-%m-%d}|{topic['source_url']}"
     return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _pick_discussion_question(topic: dict) -> str:
+    """Select the deterministic reader prompt shared across Threads, IG captions, and closing cards."""
+    seed = _story_seed(topic)
+    topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
+    prompts = DISCUSSION_PROMPTS.get(topic_tag, DISCUSSION_PROMPTS["Artificial Intelligence"])
+    return prompts[seed % len(prompts)]
 
 
 def _fetch_recent_thread_texts() -> list[str]:
@@ -334,7 +346,7 @@ def _fetch_article_paragraphs(url: str, allowed_host: str, contact: str) -> list
         parser = _ArticleParagraphExtractor()
         parser.feed(html_snippet)
         parser.close()
-        paragraphs = parser.paragraphs[:4]
+        paragraphs = parser.paragraphs[:12]
         char_counts = [len(p) for p in paragraphs]
         LOGGER.info(
             "[2/6 Article] Extracted %d paragraph(s) (chars=%s, html_bytes=%d, status=%s, %.2fs).",
@@ -423,10 +435,18 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
                 skipped_age += 1
                 continue
 
-            raw_summary = item.findtext("description") or item.findtext(CONTENT_ENCODED_TAG) or ""
-            summary = _extract_plain_text(raw_summary)
+            desc_html = item.findtext("description") or ""
+            encoded_html = item.findtext(CONTENT_ENCODED_TAG) or ""
+            summary = _extract_plain_text(desc_html or encoded_html)
             if summary.lower() == title.lower():
                 summary = ""
+
+            rss_blocks: list[str] = []
+            if encoded_html:
+                rss_parser = _ArticleParagraphExtractor()
+                rss_parser.feed(encoded_html[:MAX_ARTICLE_BYTES])
+                rss_parser.close()
+                rss_blocks = rss_parser.paragraphs[:12]
 
             story = {
                 "source": source,
@@ -434,10 +454,12 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
                 "text": title,
                 "summary": summary,
                 "paragraphs": [],
+                "content_blocks": rss_blocks,
                 "source_url": link,
                 "published": published.astimezone(timezone.utc),
             }
             story["topic_tag"] = _pick_topic_tag(story)
+            story["discussion_prompt"] = _pick_discussion_question(story)
             stories[link] = story
             kept += 1
 
@@ -525,8 +547,12 @@ def _collect_context_blocks(topic: dict) -> list[str]:
     title_low = topic["text"].lower()
     blocks: list[str] = []
     raw_summary = _trim_incomplete_tail(topic.get("summary") or "")
-    # Prefer complete article <p> paragraphs first; add RSS summary only if distinct.
-    candidates = list(topic.get("paragraphs") or []) + ([raw_summary] if raw_summary else [])
+    # Prefer complete article <p>/<li> blocks first, then RSS <content:encoded> blocks, then RSS summary.
+    candidates = (
+        list(topic.get("paragraphs") or [])
+        + list(topic.get("content_blocks") or [])
+        + ([raw_summary] if raw_summary else [])
+    )
     for candidate in candidates:
         cleaned = candidate.strip()
         if not cleaned or len(cleaned) < 25:
@@ -755,7 +781,7 @@ def _clean_multiline_caption(text: str) -> str:
 
 
 def _build_instagram_caption_template(topic: dict) -> str:
-    """Build a structured Instagram caption complementing the 1080x1350 news card."""
+    """Build a structured, detailed Instagram caption complementing a multi-card carousel."""
     seed = _story_seed(topic)
     emoji = SOURCE_EMOJIS.get(topic["source"], "🤖")
     topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
@@ -766,8 +792,7 @@ def _build_instagram_caption_template(topic: dict) -> str:
         date_label=date_label,
         topic_tag=topic_tag,
     )
-    prompts = DISCUSSION_PROMPTS.get(topic_tag, DISCUSSION_PROMPTS["Artificial Intelligence"])
-    question = prompts[seed % len(prompts)]
+    question = topic.get("discussion_prompt") or _pick_discussion_question(topic)
     footer = _instagram_footer(topic)
 
     body_budget = min(
@@ -776,21 +801,23 @@ def _build_instagram_caption_template(topic: dict) -> str:
     )
     sections = [hook]
     blocks = _prepare_context_blocks(topic)
-    # Include the headline in paragraph 2 if the first context block isn't self-explanatory.
     headline = topic["text"].strip()
     if headline:
         sections.append(headline if headline[-1] in ".!?" else f"{headline}.")
 
     for block in blocks:
-        candidate = "\n\n".join(sections + [block, question])
+        candidate = "\n\n".join(sections + [block, "📑 Swipe through the cards for the full story breakdown.", question])
         if _post_weight(candidate) <= body_budget:
             sections.append(block)
         else:
             remaining = body_budget - _post_weight("\n\n".join(sections + ["", question]))
-            if len(sections) <= 2 and remaining >= 80:
+            if len(sections) <= 3 and remaining >= 80:
                 sections.append(_shorten(block, remaining))
             break
 
+    swipe_cue = "📑 Swipe through the cards for the full breakdown."
+    if len(blocks) >= 2 and _post_weight("\n\n".join(sections + [swipe_cue, question])) <= body_budget:
+        sections.append(swipe_cue)
     if _post_weight("\n\n".join(sections + [question])) <= body_budget:
         sections.append(question)
     body = _shorten("\n\n".join(sections), body_budget)
@@ -798,7 +825,7 @@ def _build_instagram_caption_template(topic: dict) -> str:
 
 
 def generate_instagram_caption(topic: dict) -> str:
-    """Generate an Instagram feed caption pairing with the 1080x1350 news card."""
+    """Generate an Instagram feed caption pairing with the multi-card 1080x1350 carousel."""
     fallback = _build_instagram_caption_template(topic)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -817,18 +844,19 @@ def generate_instagram_caption(topic: dict) -> str:
         IG_BODY_TARGET_LENGTH,
         MAX_IG_CAPTION_LENGTH - _post_weight(f"\n\n{footer}"),
     )
-    source_material = _story_source_material(topic, max_context_chars=2200)
+    source_material = _story_source_material(topic, max_context_chars=3000)
     system_prompt = (
-        "Write an engaging Instagram feed caption to accompany a news graphic card about "
-        "this tech story. Line 1 MUST be a punchy, scroll-stopping hook under 110 characters "
-        "before the '...more' fold. Follow with 2-3 short readable paragraphs covering concrete "
-        "facts/numbers from the details, and end with 1 thoughtful question to spark comments. "
+        "Write an engaging, informative Instagram feed caption to accompany a multi-card "
+        "news carousel about this tech story. Line 1 MUST be a punchy, scroll-stopping hook "
+        "under 110 characters before the '...more' fold. Follow with 3-4 short, clear paragraphs "
+        "covering concrete facts, metrics, and implications from the details, invite readers to "
+        "swipe through the cards, and end with 1 thoughtful question to spark comments. "
         "No URLs, no domain names, no hashtags, no @mentions, no Markdown (**bold** or bullet *). "
         f"Stay under {body_budget} characters total."
     )
 
     try:
-        content = _call_groq(api_key, system_prompt, source_material, max_tokens=500)
+        content = _call_groq(api_key, system_prompt, source_material, max_tokens=620)
         body = _clean_multiline_caption(content)
         if (
             not body
@@ -1191,36 +1219,23 @@ def _resolve_card_image_url(card_path: Path) -> str:
     )
 
 
-def post_to_instagram(image_url: str, caption: str) -> str:
-    """Publish a JPEG photo post via Meta Instagram Graph API (Unified Login / graph.facebook.com)."""
-    if not image_url.startswith("https://"):
-        raise ValueError("Instagram image_url must be a public HTTPS URL.")
-    if not caption.strip() or _post_weight(caption) > MAX_IG_CAPTION_LENGTH:
-        raise ValueError("Instagram caption must be non-empty and within 2,200 characters.")
-    user_id, access_token = _require_instagram_credentials()
-
-    LOGGER.info(
-        "[6/6 Instagram] Creating container | endpoint=%s/%s/media | caption=%d/%d chars | image_url=%s",
-        INSTAGRAM_API_BASE,
-        user_id,
-        len(caption),
-        MAX_IG_CAPTION_LENGTH,
-        image_url,
-    )
+def _create_instagram_container(
+    user_id: str,
+    access_token: str,
+    payload: dict[str, str],
+    label: str,
+) -> str:
+    """Create one Instagram Graph API media container, wait until FINISHED, and return its ID."""
     container_resp = requests.post(
         f"{INSTAGRAM_API_BASE}/{user_id}/media",
-        data={
-            "image_url": image_url,
-            "caption": caption,
-            "access_token": access_token,
-        },
+        data={**payload, "access_token": access_token},
         timeout=HTTP_TIMEOUT,
     )
     container_resp.raise_for_status()
     creation_id = container_resp.json().get("id")
     if not creation_id:
         raise ValueError("Instagram did not return a container ID.")
-    LOGGER.info("[6/6 Instagram] Created container ID=%s (HTTP %s).", creation_id, container_resp.status_code)
+    LOGGER.info("[6/6 Instagram] Created %s container ID=%s (HTTP %s).", label, creation_id, container_resp.status_code)
 
     _wait_for_container(
         str(creation_id),
@@ -1231,7 +1246,11 @@ def post_to_instagram(image_url: str, caption: str) -> str:
         fields="status_code,status",
         platform="Instagram",
     )
+    return str(creation_id)
 
+
+def _publish_instagram_container(user_id: str, access_token: str, creation_id: str) -> str:
+    """Publish a prepared Instagram single or carousel container via /media_publish."""
     LOGGER.info("[6/6 Instagram] Publishing container ID=%s via media_publish...", creation_id)
     publish_resp = requests.post(
         f"{INSTAGRAM_API_BASE}/{user_id}/media_publish",
@@ -1247,6 +1266,76 @@ def post_to_instagram(image_url: str, caption: str) -> str:
         raise ValueError("Instagram did not return a media ID; check Instagram before retrying.")
     LOGGER.info("[6/6 Instagram] Published media ID=%s (HTTP %s).", media_id, publish_resp.status_code)
     return str(media_id)
+
+
+def post_to_instagram(image_url: str, caption: str) -> str:
+    """Publish a JPEG photo post via Meta Instagram Graph API (Unified Login / graph.facebook.com)."""
+    if not image_url.startswith("https://"):
+        raise ValueError("Instagram image_url must be a public HTTPS URL.")
+    if not caption.strip() or _post_weight(caption) > MAX_IG_CAPTION_LENGTH:
+        raise ValueError("Instagram caption must be non-empty and within 2,200 characters.")
+    user_id, access_token = _require_instagram_credentials()
+
+    LOGGER.info(
+        "[6/6 Instagram] Creating photo container | endpoint=%s/%s/media | caption=%d/%d chars | image_url=%s",
+        INSTAGRAM_API_BASE,
+        user_id,
+        len(caption),
+        MAX_IG_CAPTION_LENGTH,
+        image_url,
+    )
+    creation_id = _create_instagram_container(
+        user_id,
+        access_token,
+        {"image_url": image_url, "caption": caption},
+        label="photo",
+    )
+    return _publish_instagram_container(user_id, access_token, creation_id)
+
+
+def post_instagram_carousel(image_urls: list[str], caption: str) -> str:
+    """Publish a 2-10 slide JPEG carousel post (or single photo if len == 1) to Instagram."""
+    if not image_urls or len(image_urls) > 10:
+        raise ValueError("Instagram carousel requires between 1 and 10 HTTPS image URLs.")
+    for url in image_urls:
+        if not url.startswith("https://"):
+            raise ValueError("Instagram image_url must be a public HTTPS URL.")
+    if len(image_urls) == 1:
+        return post_to_instagram(image_urls[0], caption)
+    if not caption.strip() or _post_weight(caption) > MAX_IG_CAPTION_LENGTH:
+        raise ValueError("Instagram caption must be non-empty and within 2,200 characters.")
+    user_id, access_token = _require_instagram_credentials()
+
+    LOGGER.info(
+        "[6/6 Instagram] Creating %d-slide CAROUSEL | endpoint=%s/%s/media | caption=%d/%d chars",
+        len(image_urls),
+        INSTAGRAM_API_BASE,
+        user_id,
+        len(caption),
+        MAX_IG_CAPTION_LENGTH,
+    )
+    child_ids: list[str] = []
+    for idx, url in enumerate(image_urls, start=1):
+        LOGGER.info("[6/6 Instagram] Preparing slide %d/%d: %s", idx, len(image_urls), url)
+        child_id = _create_instagram_container(
+            user_id,
+            access_token,
+            {"image_url": url, "is_carousel_item": "true"},
+            label=f"carousel-item {idx}/{len(image_urls)}",
+        )
+        child_ids.append(child_id)
+
+    parent_id = _create_instagram_container(
+        user_id,
+        access_token,
+        {
+            "media_type": "CAROUSEL",
+            "children": ",".join(child_ids),
+            "caption": caption,
+        },
+        label="CAROUSEL parent",
+    )
+    return _publish_instagram_container(user_id, access_token, parent_id)
 
 
 def _fetch_instagram_permalink(media_id: str) -> str | None:
@@ -1269,15 +1358,28 @@ def _fetch_instagram_permalink(media_id: str) -> str | None:
 
 
 def publish_instagram_card(topic: dict, caption: str) -> str:
-    """Render the topic's 1080x1350 card, upload to public HTTPS storage, and publish to Instagram."""
-    from card_generator import render_news_card
+    """Render multi-slide 1080x1350 carousel cards, upload to HTTPS host, and publish to Instagram."""
+    from card_generator import render_news_card, render_news_carousel
 
     slug = hashlib.sha256(topic["source_url"].encode("utf-8")).hexdigest()[:8]
-    filename = f"{topic['published']:%Y%m%d}-{slug}.jpg"
+    stem = f"{topic['published']:%Y%m%d}-{slug}"
+    explicit_single_url = os.getenv("IG_IMAGE_URL", "").strip()
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        card_path = render_news_card(topic, Path(tmpdir) / filename)
-        image_url = _resolve_card_image_url(card_path)
-    media_id = post_to_instagram(image_url, caption)
+        if explicit_single_url:
+            card_path = render_news_card(topic, Path(tmpdir) / f"{stem}.jpg")
+            image_urls = [_resolve_card_image_url(card_path)]
+        else:
+            slide_paths = render_news_carousel(
+                topic,
+                tmpdir,
+                stem=stem,
+                max_slides=MAX_CAROUSEL_SLIDES,
+                discussion_prompt=topic.get("discussion_prompt") or _pick_discussion_question(topic),
+            )
+            image_urls = [_resolve_card_image_url(p) for p in slide_paths]
+
+    media_id = post_instagram_carousel(image_urls, caption)
     permalink = _fetch_instagram_permalink(media_id)
     if permalink:
         LOGGER.info("[6/6 Instagram] Live post permalink: %s", permalink)
@@ -1400,19 +1502,30 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Refreshed token (expires_in={expires_in}s):\n{refreshed['access_token']}")
             return 0
         if len(args) == 2 and args[0] == "--save-card":
-            from card_generator import render_news_card
+            from card_generator import render_news_carousel
 
             topic = get_topic_of_the_day()
             if topic is None:
                 LOGGER.info("Pipeline completed in %.2fs (no story to save).", time.monotonic() - started)
                 return 0
-            out_path = Path(render_news_card(topic, args[1]))
+            target = Path(args[1])
+            slides = render_news_carousel(
+                topic,
+                target.parent,
+                stem=target.stem,
+                max_slides=MAX_CAROUSEL_SLIDES,
+                discussion_prompt=topic.get("discussion_prompt") or _pick_discussion_question(topic),
+            )
+            if slides and slides[0] != target:
+                slides[0].replace(target)
+                slides[0] = target
             caption = generate_instagram_caption(topic)
-            caption_path = out_path.with_suffix(".caption.txt")
+            caption_path = target.with_suffix(".caption.txt")
             caption_path.write_text(caption + "\n", encoding="utf-8")
             LOGGER.info(
-                "Saved preview card to %s and Instagram caption to %s (%s chars; no posts sent).\n\n--- [Instagram Caption Preview] ---\n%s",
-                out_path,
+                "Saved %d preview card slide(s) (%s) and Instagram caption to %s (%s chars; no posts sent).\n\n--- [Instagram Caption Preview] ---\n%s",
+                len(slides),
+                ", ".join(p.name for p in slides),
                 caption_path,
                 len(caption),
                 caption,
@@ -1448,6 +1561,7 @@ def main(argv: list[str] | None = None) -> int:
         ig_caption = generate_instagram_caption(topic) if enable_instagram == "true" else ""
 
         if dry_run == "true":
+            slides: list[Path] = []
             if enable_threads == "true":
                 preview = "\n\n--- [Reply in Thread] ---\n\n".join(posts)
                 LOGGER.info(
@@ -1458,13 +1572,20 @@ def main(argv: list[str] | None = None) -> int:
                     topic["source_url"],
                 )
             if enable_instagram == "true":
-                from card_generator import render_news_card
+                from card_generator import render_news_carousel
 
                 slug = hashlib.sha256(topic["source_url"].encode("utf-8")).hexdigest()[:8]
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    render_news_card(topic, Path(tmpdir) / f"{topic['published']:%Y%m%d}-{slug}.jpg")
+                    slides = render_news_carousel(
+                        topic,
+                        tmpdir,
+                        stem=f"{topic['published']:%Y%m%d}-{slug}",
+                        max_slides=MAX_CAROUSEL_SLIDES,
+                        discussion_prompt=topic.get("discussion_prompt") or _pick_discussion_question(topic),
+                    )
                 LOGGER.info(
-                    "DRY RUN: no Instagram request made. Caption preview (%s chars):\n%s",
+                    "DRY RUN: no Instagram request made (%d carousel slide(s) ready). Caption preview (%s chars):\n%s",
+                    len(slides),
                     len(ig_caption),
                     ig_caption,
                 )
@@ -1473,7 +1594,7 @@ def main(argv: list[str] | None = None) -> int:
                 elapsed_s=time.monotonic() - started,
                 topic=topic,
                 threads_status="Previewed (dry run)" if enable_threads == "true" else "Disabled",
-                ig_status="Card rendered + caption previewed (dry run)" if enable_instagram == "true" else "Disabled",
+                ig_status=f"{len(slides)}-slide carousel rendered + caption previewed (dry run)" if enable_instagram == "true" else "Disabled",
                 posts=posts,
                 ig_caption=ig_caption,
             )

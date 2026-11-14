@@ -57,6 +57,36 @@ class CardGeneratorTests(unittest.TestCase):
             out = cg.render_news_card(long_topic, Path(tmpdir) / "long.jpg")
             self.assertGreater(out.stat().st_size, 10_000)
 
+    def test_carousel_renders_multiple_1080x1350_slides_across_all_themes(self):
+        rich_topic = {
+            **self.topic,
+            "paragraphs": [
+                f"Paragraph {idx}: Concrete benchmark results and deployment architecture details from the official engineering release for enterprise teams and researchers."
+                for idx in range(1, 9)
+            ],
+            "discussion_prompt": "Would you trust an AI agent with controlled checkout permissions?",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cover_bytes = []
+            for theme in cg.CARD_THEMES:
+                slides = cg.render_news_carousel(
+                    rich_topic,
+                    Path(tmpdir) / theme,
+                    theme=theme,
+                    max_slides=5,
+                    stem="deck",
+                )
+                self.assertGreaterEqual(len(slides), 3)
+                self.assertLessEqual(len(slides), 5)
+                for slide in slides:
+                    self.assertTrue(slide.is_file())
+                    with Image.open(slide) as img:
+                        self.assertEqual(img.format, "JPEG")
+                        self.assertEqual(img.size, (1080, 1350))
+                        self.assertEqual(img.mode, "RGB")
+                cover_bytes.append(slides[0].read_bytes())
+            self.assertEqual(len(set(cover_bytes)), len(cg.CARD_THEMES))
+
 
 if __name__ == "__main__":
     unittest.main()
