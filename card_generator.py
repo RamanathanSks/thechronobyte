@@ -2,7 +2,6 @@
 
 from pathlib import Path
 import unicodedata
-from urllib.parse import urlsplit
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -206,16 +205,19 @@ def render_news_card(topic: dict, output_path: str | Path, handle: str = "@thech
     font_brand = _load_font("semibold", 24)
     font_sub = _load_font("regular", 19)
     font_pill = _load_font("bold", 20)
-    font_headline = _load_font("bold", 60)
-    font_body = _load_font("regular", 32)
-    font_footer_title = _load_font("semibold", 24)
-    font_footer_sub = _load_font("regular", 21)
+    font_headline = _load_font("bold", 62)
+    font_body = _load_font("regular", 34)
 
     # Top header bar.
     dot_y = 78
     chrome_draw.rounded_rectangle((margin, dot_y + 5, margin + 16, dot_y + 21), radius=4, fill=(*accent, 255))
     chrome_draw.text((margin + 28, dot_y), "CHRONO BYTE", font=font_brand, fill=(248, 250, 252, 255))
-    chrome_draw.text((margin + 28, dot_y + 32), "DAILY AI & SILICON BRIEF", font=font_sub, fill=(148, 163, 184, 255))
+    chrome_draw.text(
+        (margin + 28, dot_y + 32),
+        f"DAILY AI & SILICON BRIEF  ·  {handle}",
+        font=font_sub,
+        fill=(148, 163, 184, 255),
+    )
 
     published = topic["published"]
     date_label = published.strftime("%b %d, %Y").upper().replace(" 0", " ")
@@ -254,59 +256,29 @@ def render_news_card(topic: dict, output_path: str | Path, handle: str = "@thech
             text_fill=(203, 213, 225, 255),
         )
 
-    # Bottom footer card (translucent glass).
-    footer_top = 1146
-    chrome_draw.rounded_rectangle(
-        (margin, footer_top, CARD_WIDTH - margin, 1272),
-        radius=24,
-        fill=(15, 23, 42, 185),
-        outline=(255, 255, 255, 34),
-        width=2,
-    )
-    chrome_draw.text((margin + 30, footer_top + 26), handle, font=font_footer_title, fill=(248, 250, 252, 255))
-    host = urlsplit(topic.get("source_url", "")).hostname or "official source"
-    chrome_draw.text(
-        (margin + 30, footer_top + 64),
-        f"Source: {host}  ·  Full thread on Threads",
-        font=font_footer_sub,
-        fill=(148, 163, 184, 255),
-    )
-
-    cta = "READ FULL STORY"
-    cta_w = int(_text_width(chrome_draw, cta, font_pill)) + 44
-    _draw_pill(
-        chrome_draw,
-        (CARD_WIDTH - margin - cta_w - 28, footer_top + 38),
-        cta,
-        font_pill,
-        fill=(*accent, 235),
-        outline=None,
-        text_fill=(10, 13, 20, 255),
-    )
-
     canvas = Image.alpha_composite(canvas, chrome)
     draw = ImageDraw.Draw(canvas)
 
     # Main headline.
     headline_lines = _wrap_text(draw, headline_text, font_headline, content_width, max_lines=4)
     if len(headline_lines) >= 4:
-        font_headline = _load_font("bold", 52)
+        font_headline = _load_font("bold", 54)
         headline_lines = _wrap_text(draw, headline_text, font_headline, content_width, max_lines=4)
 
-    y = 286
+    y = 288
     line_step = int(font_headline.size * 1.2)
     for line in headline_lines:
         draw.text((margin, y), line, font=font_headline, fill=(248, 250, 252, 255))
         y += line_step
 
     # Accent divider bar.
-    y += 18
+    y += 20
     draw.rounded_rectangle((margin, y, margin + 96, y + 6), radius=3, fill=(*accent, 255))
-    y += 38
+    y += 40
 
-    # Body paragraphs (clipped cleanly above footer card).
-    max_body_y = footer_top - 42
-    body_step = 46
+    # Body paragraphs (generous clean bottom margin; source/links go in caption).
+    max_body_y = CARD_HEIGHT - 96
+    body_step = 48
     paragraphs = _build_body_paragraphs(topic)
     for para in paragraphs:
         remaining_lines = max(0, (max_body_y - y) // body_step)
@@ -316,7 +288,7 @@ def render_news_card(topic: dict, output_path: str | Path, handle: str = "@thech
         for line in wrapped:
             draw.text((margin, y), line, font=font_body, fill=(203, 213, 225, 255))
             y += body_step
-        y += 20
+        y += 24
 
     dest = Path(output_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
