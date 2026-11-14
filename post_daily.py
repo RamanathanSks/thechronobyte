@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -325,6 +326,52 @@ def _require_threads_credentials() -> tuple[str, str]:
     return user_id, access_token
 
 
+def _wait_for_container(creation_id: str, access_token: str, max_attempts: int = 5, delay_seconds: float = 2.0) -> None:
+    """Wait briefly for Threads link/media container processing to finish."""
+    for attempt in range(max_attempts):
+        resp = requests.get(
+            f"{THREADS_API_BASE}/{creation_id}",
+            params={"fields": "status,error_message"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        status = str(payload.get("status", "")).upper()
+        if status in {"", "FINISHED", "PUBLISHED"}:
+            return
+        if status in {"ERROR", "EXPIRED"}:
+            detail = _clean_text(str(payload.get("error_message") or status))
+            raise ValueError(f"Threads container failed ({detail}).")
+        if attempt < max_attempts - 1:
+            time.sleep(delay_seconds)
+    raise ValueError("Threads container did not finish processing in time.")
+
+
+def _safe_api_error_detail(error: requests.HTTPError, secret: str = "") -> str:
+    """Extract sanitized Meta error metadata without exposing credentials."""
+    if error.response is None:
+        return ""
+    try:
+        payload = error.response.json()
+    except ValueError:
+        return ""
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(err, dict):
+        return ""
+    parts = []
+    if err.get("code") is not None:
+        parts.append(f"code={err['code']}")
+    if err.get("error_subcode") is not None:
+        parts.append(f"subcode={err['error_subcode']}")
+    if err.get("message"):
+        msg = _clean_text(str(err["message"]))
+        if secret:
+            msg = msg.replace(secret, "[REDACTED]")
+        parts.append(msg[:200])
+    return ", ".join(parts)
+
+
 def post_to_threads(
     post_text: str,
     link_url: str,
@@ -366,6 +413,8 @@ def post_to_threads(
     creation_id = container_resp.json().get("id")
     if not creation_id:
         raise ValueError("Threads did not return a container ID.")
+
+    _wait_for_container(str(creation_id), access_token)
 
     publish_resp = requests.post(
         f"{THREADS_API_BASE}/{user_id}/threads_publish",
@@ -437,10 +486,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except requests.HTTPError as error:
         status = error.response.status_code if error.response is not None else "unknown"
+        detail = _safe_api_error_detail(error, os.getenv("THREADS_ACCESS_TOKEN", "").strip())
+        suffix = f" ({detail})" if detail else ""
         LOGGER.error(
-            "Threads/API HTTP error (status %s). Check token validity, permissions "
+            "Threads/API HTTP error (status %s)%s. Check token validity, permissions "
             "(threads_basic, threads_content_publish), and tester status.",
             status,
+            suffix,
         )
     except requests.RequestException:
         LOGGER.error("API/network request failed. If publishing, check Threads before retrying.")

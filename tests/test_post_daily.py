@@ -276,7 +276,15 @@ class DailyThreadsPostTests(unittest.TestCase):
             self.response({"id": "container-111"}),
             self.response({"id": "post-999"}),
         ]
-        with patch.object(bot.requests, "post", side_effect=responses) as post:
+        status_responses = [
+            self.response({"id": "container-111", "status": "IN_PROGRESS"}),
+            self.response({"id": "container-111", "status": "FINISHED"}),
+        ]
+        with (
+            patch.object(bot.requests, "post", side_effect=responses) as post,
+            patch.object(bot.requests, "get", side_effect=status_responses) as get,
+            patch.object(bot.time, "sleep") as sleep,
+        ):
             post_id = bot.post_to_threads(
                 "NVIDIA news",
                 self.topic["source_url"],
@@ -285,6 +293,8 @@ class DailyThreadsPostTests(unittest.TestCase):
             )
         self.assertEqual(post_id, "post-999")
         self.assertEqual(post.call_count, 2)
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(2.0)
 
         first_call, second_call = post.call_args_list
         self.assertEqual(first_call.args[0], "https://graph.threads.net/v1.0/1234567890/threads")
@@ -305,11 +315,26 @@ class DailyThreadsPostTests(unittest.TestCase):
         })
         self.assertEqual(second_call.kwargs["timeout"], (5, 20))
 
+    def test_container_error_prevents_publish(self):
+        self.credentials()
+        with (
+            patch.object(bot.requests, "post", return_value=self.response({"id": "container-111"})) as post,
+            patch.object(
+                bot.requests,
+                "get",
+                return_value=self.response({"id": "container-111", "status": "ERROR", "error_message": "Bad link"}),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "Bad link"):
+                bot.post_to_threads("A fact.", self.topic["source_url"])
+        post.assert_called_once()
+
     def test_publish_timeout_is_not_retried(self):
         self.credentials()
-        with patch.object(
-            bot.requests, "post", side_effect=[self.response({"id": "container-111"}), requests.Timeout]
-        ) as post:
+        with (
+            patch.object(bot.requests, "post", side_effect=[self.response({"id": "container-111"}), requests.Timeout]) as post,
+            patch.object(bot.requests, "get", return_value=self.response({"status": "FINISHED"})),
+        ):
             with self.assertRaises(requests.Timeout):
                 bot.post_to_threads("A fact.", self.topic["source_url"])
         self.assertEqual(post.call_count, 2)
@@ -319,8 +344,9 @@ class DailyThreadsPostTests(unittest.TestCase):
         with patch.object(bot.requests, "post", return_value=self.response({})):
             with self.assertRaisesRegex(ValueError, "container ID"):
                 bot.post_to_threads("A fact.", self.topic["source_url"])
-        with patch.object(
-            bot.requests, "post", side_effect=[self.response({"id": "container-111"}), self.response({})]
+        with (
+            patch.object(bot.requests, "post", side_effect=[self.response({"id": "container-111"}), self.response({})]),
+            patch.object(bot.requests, "get", return_value=self.response({"status": "FINISHED"})),
         ):
             with self.assertRaisesRegex(ValueError, "post ID"):
                 bot.post_to_threads("A fact.", self.topic["source_url"])
@@ -374,14 +400,16 @@ class DailyThreadsPostTests(unittest.TestCase):
     def test_main_http_error_returns_nonzero_without_leaking_token(self):
         self.credentials()
         os.environ["DRY_RUN"] = "false"
-        response = self.response({"error": {"message": "bad token"}}, 401)
+        response = self.response({"error": {"code": 190, "message": "bad token test-threads-token"}}, 401)
         response.url = "https://graph.threads.net/v1.0/1234567890/threads"
         with patch.object(bot, "get_topic_of_the_day", return_value=self.topic):
             with patch.object(bot.requests, "post", return_value=response):
                 with self.assertLogs(bot.LOGGER, level="ERROR") as logs:
                     self.assertEqual(bot.main([]), 1)
-        self.assertNotIn("test-threads-token", " ".join(logs.output))
-        self.assertIn("401", " ".join(logs.output))
+        combined = " ".join(logs.output)
+        self.assertNotIn("test-threads-token", combined)
+        self.assertIn("401", combined)
+        self.assertIn("code=190", combined)
 
 
 if __name__ == "__main__":
