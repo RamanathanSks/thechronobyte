@@ -16,10 +16,10 @@ PAPER_CREAM = (245, 242, 234)
 PAPER_BUFF = (238, 232, 218)
 NOIR_INK = (19, 21, 25)
 INK_PRIMARY = (20, 22, 24)
-INK_SECONDARY = (52, 55, 58)
-INK_MUTED = (120, 116, 108)
+INK_SECONDARY = (48, 51, 55)
+INK_MUTED = (118, 114, 106)
 LIGHT_PRIMARY = (244, 241, 232)
-LIGHT_SECONDARY = (202, 198, 190)
+LIGHT_SECONDARY = (206, 202, 194)
 LIGHT_MUTED = (142, 140, 134)
 
 CARD_THEMES = ("framed_gallery", "dark_duotone", "riso_poster", "editorial_horizon")
@@ -154,18 +154,17 @@ def _topic_seed(topic: dict) -> int:
     return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:12], 16)
 
 
-def _build_subhead(topic: dict, max_chars: int = 210) -> str:
-    """Select one crisp 2-4 line editorial subheadline distinct from the headline."""
+def _build_body_blocks(topic: dict, max_blocks: int = 3) -> list[str]:
+    """Collect distinct, substantive paragraphs + RSS lead without repeating headline."""
     title_low = _strip_invisible(topic["text"]).lower()
+    summary = re.sub(r"\s*(?:\[\u2026\]|\[\.\.\.\]|…)$", "", (topic.get("summary") or "").strip())
     raw_items = list(topic.get("paragraphs") or [])
-    summary = (topic.get("summary") or "").strip()
     if summary:
         raw_items.append(summary)
 
-    chosen = ""
+    selected: list[str] = []
     for item in raw_items:
-        cleaned = _strip_invisible(item).rstrip("…")
-        cleaned = re.sub(r"\s*(?:\[\u2026\]|\[\.\.\.\]|…)$", "", cleaned).strip()
+        cleaned = re.sub(r"\s*(?:\[\u2026\]|\[\.\.\.\]|…)$", "", _strip_invisible(item)).strip()
         if not cleaned or len(cleaned) < 25:
             continue
         low = cleaned.lower()
@@ -175,24 +174,24 @@ def _build_subhead(topic: dict, max_chars: int = 210) -> str:
             cleaned = cleaned[len(title_low):].lstrip(" ,:—-")
             if cleaned:
                 cleaned = cleaned[0].upper() + cleaned[1:]
-        chosen = cleaned
-        break
+                low = cleaned.lower()
+        joined = " ".join(selected).lower()
+        if low in joined or low[:55] in joined:
+            continue
+        if any(existing.lower() in low or existing.lower()[:55] == low[:55] for existing in selected):
+            for idx, existing in enumerate(selected):
+                if existing.lower() in low or existing.lower()[:55] == low[:55]:
+                    if len(cleaned) > len(existing):
+                        selected[idx] = cleaned
+                    break
+            continue
+        selected.append(cleaned)
+        if len(selected) == max_blocks:
+            break
+    return selected
 
-    if not chosen:
-        return ""
-    if len(chosen) <= max_chars:
-        return chosen
-    clipped = chosen[:max_chars]
-    for sep in (". ", "! ", "? "):
-        idx = clipped.rfind(sep)
-        if idx >= 70:
-            return clipped[: idx + 1].strip()
-    if " " in clipped:
-        clipped = clipped.rsplit(" ", 1)[0]
-    return clipped.rstrip(" ,;:-") + "…"
 
-
-def _apply_analog_grain(image: Image.Image, strength: float = 0.42) -> Image.Image:
+def _apply_analog_grain(image: Image.Image, strength: float = 0.40) -> Image.Image:
     """Overlay crisp multi-scale analog print/film grain over an RGB/RGBA image."""
     w, h = image.size
     base_rgb = image.convert("RGB")
@@ -214,11 +213,11 @@ def _draw_masthead(
     muted_fill: tuple[int, int, int, int],
     rule_fill: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """Draw the minimal Chrono Byte editorial masthead bar across the top."""
+    """Draw the Chrono Byte editorial masthead bar across the top."""
     font_bold = _load_font("semibold", 18)
     font_reg = _load_font("regular", 18)
     margin_x = 76
-    top_y = 54
+    top_y = 52
 
     draw.rounded_rectangle((margin_x, top_y + 4, margin_x + 12, top_y + 16), radius=3, fill=(*accent, 255))
     brand = "CHRONO BYTE"
@@ -232,7 +231,7 @@ def _draw_masthead(
     meta_w = _text_width(draw, meta, font_reg)
     draw.text((CARD_WIDTH - margin_x - meta_w, top_y), meta, font=font_reg, fill=muted_fill)
     if rule_fill is not None:
-        draw.line((margin_x, 102, CARD_WIDTH - margin_x, 102), fill=rule_fill, width=1)
+        draw.line((margin_x, 98, CARD_WIDTH - margin_x, 98), fill=rule_fill, width=1)
 
 
 def _draw_text_lines(
@@ -251,6 +250,31 @@ def _draw_text_lines(
         draw_x = (CARD_WIDTH - _text_width(draw, line, font)) / 2 if centered else float(x)
         draw.text((draw_x, y), line, font=font, fill=fill)
         y += line_step
+    return y
+
+
+def _draw_paragraph_blocks(
+    draw: ImageDraw.ImageDraw,
+    blocks: list[str],
+    x: int,
+    start_y: int,
+    max_y: int,
+    width: int,
+    font: ImageFont.ImageFont,
+    line_step: int,
+    fill: tuple[int, int, int, int],
+    para_gap: int = 20,
+    centered: bool = False,
+) -> int:
+    """Draw multiple rich paragraphs cleanly until vertical space fills without overflow."""
+    y = start_y
+    for block in blocks:
+        remaining = max(0, (max_y - y) // line_step)
+        if remaining < 2:
+            break
+        lines = _wrap_text(draw, block, font, width, max_lines=remaining)
+        y = _draw_text_lines(draw, lines, x, y, line_step, font, fill, centered=centered)
+        y += para_gap
     return y
 
 
@@ -276,7 +300,7 @@ def _render_framed_gallery(
     seed: int,
     handle: str,
 ) -> Image.Image:
-    """Architectural magazine cover: crisp left editorial copy over a framed art plate."""
+    """Architectural magazine cover: dense readable brief above a framed lower art plate."""
     accent, wash, deep, highlight = palette
     rng = random.Random(seed)
 
@@ -289,22 +313,31 @@ def _render_framed_gallery(
     margin_x = 76
     content_w = CARD_WIDTH - margin_x * 2
     headline = _strip_invisible(topic["text"])
-    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 64, 54, font_weight="serif_bold")
+    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 60, 52, font_weight="serif_bold")
     h_step = int(h_font.size * 1.14)
-    h_end = _draw_text_lines(draw, h_lines, margin_x, 146, h_step, h_font, (*INK_PRIMARY, 255))
+    h_end = _draw_text_lines(draw, h_lines, margin_x, 132, h_step, h_font, (*INK_PRIMARY, 255))
 
-    # Accent hairline rule separating headline & lead.
-    rule_y = h_end + 22
+    rule_y = h_end + 18
     draw.rectangle((margin_x, rule_y, margin_x + 76, rule_y + 4), fill=(*accent, 255))
 
-    subhead = _build_subhead(topic, max_chars=215)
-    body_font = _load_font("regular", 30)
-    b_lines = _wrap_text(draw, subhead, body_font, content_w - 40, max_lines=4) if subhead else []
-    body_end = _draw_text_lines(draw, b_lines, margin_x, rule_y + 26, 42, body_font, (*INK_SECONDARY, 240))
+    blocks = _build_body_blocks(topic, max_blocks=3)
+    body_font = _load_font("regular", 28)
+    body_end = _draw_paragraph_blocks(
+        draw,
+        blocks,
+        margin_x,
+        rule_y + 24,
+        max_y=845,
+        width=content_w,
+        font=body_font,
+        line_step=39,
+        fill=(*INK_SECONDARY, 242),
+        para_gap=18,
+    )
 
-    # Lower framed artwork plate.
-    plate_top = max(620, body_end + 44)
-    plate_bottom = CARD_HEIGHT - 74
+    # Flush lower artwork window cleanly under the copy with zero empty dead gap.
+    plate_top = max(560, min(865, body_end + 18))
+    plate_bottom = CARD_HEIGHT - 64
     plate_w = content_w
     plate_h = plate_bottom - plate_top
 
@@ -312,41 +345,38 @@ def _render_framed_gallery(
     art = Image.new("RGBA", (plate_w, plate_h), (0, 0, 0, 0))
     ad = ImageDraw.Draw(art)
 
-    # Flowing geometric wave + atmospheric pigment wash inside the framed window.
     shift = rng.uniform(0.0, math.tau)
     wave_pts = [
         (
             x,
             int(
-                plate_h * 0.45
-                + 58 * math.sin((x / plate_w) * math.pi * 1.6 + shift)
-                + 24 * math.cos((x / plate_w) * math.pi * 3.1 - shift)
+                plate_h * 0.42
+                + 48 * math.sin((x / plate_w) * math.pi * 1.6 + shift)
+                + 20 * math.cos((x / plate_w) * math.pi * 3.1 - shift)
             ),
         )
         for x in range(0, plate_w + 20, 20)
     ]
-    ad.polygon(wave_pts + [(plate_w, plate_h), (0, plate_h)], fill=(*wash, 230))
+    ad.polygon(wave_pts + [(plate_w, plate_h), (0, plate_h)], fill=(*wash, 232))
     ad.ellipse(
-        (rng.randint(80, 420), int(plate_h * 0.18), rng.randint(680, 960), plate_h + 180),
-        fill=(*highlight, 170),
+        (rng.randint(80, 420), int(plate_h * 0.15), rng.randint(680, 960), plate_h + 160),
+        fill=(*highlight, 175),
     )
-    ad.ellipse((-120, -140, int(plate_w * 0.55), int(plate_h * 0.65)), fill=(*accent, 110))
-    art = art.filter(ImageFilter.GaussianBlur(radius=58))
+    ad.ellipse((-120, -140, int(plate_w * 0.55), int(plate_h * 0.65)), fill=(*accent, 115))
+    art = art.filter(ImageFilter.GaussianBlur(radius=54))
     plate = Image.alpha_composite(plate, art)
 
-    # Crisp architectural linework subtly etched inside the framed artwork.
     line_layer = Image.new("RGBA", (plate_w, plate_h), (0, 0, 0, 0))
     ld = ImageDraw.Draw(line_layer)
     cx = int(plate_w * rng.uniform(0.62, 0.84))
     cy = int(plate_h * rng.uniform(0.32, 0.62))
-    for radius in (130, 210, 290, 370):
+    for radius in (120, 195, 270, 345):
         ld.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=(255, 255, 255, 42), width=2)
     plate = Image.alpha_composite(plate, line_layer)
     plate = _apply_analog_grain(plate, strength=0.38)
 
-    # Round mask for clean editorial print corners.
     mask = Image.new("L", (plate_w, plate_h), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, plate_w, plate_h), radius=18, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, plate_w, plate_h), radius=16, fill=255)
     canvas.paste(plate, (margin_x, plate_top), mask)
     return _apply_analog_grain(canvas, strength=0.16)
 
@@ -357,7 +387,7 @@ def _render_dark_duotone(
     seed: int,
     handle: str,
 ) -> Image.Image:
-    """Midnight print poster: dark charcoal surface, ivory serif, duotone ribbon glow."""
+    """Midnight print poster: full-height editorial story + luminous duotone glow."""
     accent, wash, _, highlight = palette
     rng = random.Random(seed)
 
@@ -365,18 +395,16 @@ def _render_dark_duotone(
     glow = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
 
-    # Dramatic sweeping diagonal duotone bands in bottom/right region.
     anchor_x = rng.randint(360, 840)
-    gd.ellipse((anchor_x - 520, 640, anchor_x + 540, 1480), fill=(*wash, 185))
-    gd.ellipse((rng.randint(-180, 240), 860, rng.randint(520, 880), 1560), fill=(*accent, 145))
-    gd.ellipse((rng.randint(240, 680), 960, 1180, 1520), fill=(*highlight, 130))
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=125))
+    gd.ellipse((anchor_x - 520, 620, anchor_x + 540, 1480), fill=(*wash, 175))
+    gd.ellipse((rng.randint(-180, 240), 840, rng.randint(520, 880), 1560), fill=(*accent, 135))
+    gd.ellipse((rng.randint(240, 680), 940, 1180, 1520), fill=(*highlight, 120))
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=130))
     canvas = Image.alpha_composite(canvas, glow)
 
-    # Fine editorial hairline frame + masthead.
     chrome = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
     cd = ImageDraw.Draw(chrome)
-    cd.rounded_rectangle((36, 32, CARD_WIDTH - 36, CARD_HEIGHT - 32), radius=12, outline=(255, 255, 255, 26), width=2)
+    cd.rounded_rectangle((36, 32, CARD_WIDTH - 36, CARD_HEIGHT - 32), radius=12, outline=(255, 255, 255, 28), width=2)
     _draw_masthead(
         cd, topic, handle, accent, (*LIGHT_PRIMARY, 235), (*LIGHT_MUTED, 235), rule_fill=(255, 255, 255, 28)
     )
@@ -385,22 +413,39 @@ def _render_dark_duotone(
 
     margin_x = 84
     content_w = CARD_WIDTH - margin_x * 2
-    topic_tag = _strip_invisible(topic.get("topic_tag") or "").upper()
-    tag_font = _load_font("semibold", 20)
-    y_cursor = 178
-    if topic_tag:
-        draw.text((margin_x, y_cursor), topic_tag, font=tag_font, fill=(*accent, 255))
-        y_cursor += 48
+    topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "AI BRIEF").upper()
+    tag_font = _load_font("semibold", 19)
+    draw.text((margin_x, 146), topic_tag, font=tag_font, fill=(*accent, 255))
 
     headline = _strip_invisible(topic["text"])
-    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 68, 56, font_weight="serif")
+    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 64, 54, font_weight="serif")
     h_step = int(h_font.size * 1.14)
-    h_end = _draw_text_lines(draw, h_lines, margin_x, y_cursor, h_step, h_font, (*LIGHT_PRIMARY, 255))
+    h_end = _draw_text_lines(draw, h_lines, margin_x, 188, h_step, h_font, (*LIGHT_PRIMARY, 255))
 
-    subhead = _build_subhead(topic, max_chars=220)
-    body_font = _load_font("regular", 32)
-    b_lines = _wrap_text(draw, subhead, body_font, content_w - 60, max_lines=4) if subhead else []
-    _draw_text_lines(draw, b_lines, margin_x, h_end + 36, 45, body_font, (*LIGHT_SECONDARY, 240))
+    draw.rectangle((margin_x, h_end + 18, margin_x + 84, h_end + 22), fill=(*accent, 230))
+
+    blocks = _build_body_blocks(topic, max_blocks=3)
+    body_font = _load_font("regular", 31)
+    _draw_paragraph_blocks(
+        draw,
+        blocks,
+        margin_x,
+        h_end + 48,
+        max_y=1170,
+        width=content_w - 16,
+        font=body_font,
+        line_step=44,
+        fill=(*LIGHT_SECONDARY, 245),
+        para_gap=24,
+    )
+
+    # Subtle colophon strip anchoring the bottom border cleanly.
+    draw.line((margin_x, 1226, CARD_WIDTH - margin_x, 1226), fill=(255, 255, 255, 36), width=1)
+    col_font = _load_font("regular", 17)
+    draw.text((margin_x, 1246), f"DAILY BRIEF  ·  {handle}", font=col_font, fill=(*LIGHT_MUTED, 220))
+    source_label = _strip_invisible(topic.get("source", "")).upper()
+    sw = _text_width(draw, source_label, col_font)
+    draw.text((CARD_WIDTH - margin_x - sw, 1246), source_label, font=col_font, fill=(*LIGHT_MUTED, 220))
 
     return _apply_analog_grain(canvas, strength=0.34)
 
@@ -420,7 +465,7 @@ def _render_riso_poster(
     seed: int,
     handle: str,
 ) -> Image.Image:
-    """Mid-century Swiss / Riso print: sandstone paper + multiplied geometric ink passes."""
+    """Mid-century Swiss / Riso print: full story column above multiplied ink shapes."""
     accent, wash, deep, highlight = palette
     rng = random.Random(seed)
     soft_accent = tuple(int(c * 0.72 + PAPER_BUFF[i] * 0.28) for i, c in enumerate(accent))
@@ -429,23 +474,23 @@ def _render_riso_poster(
     variant = seed % 2
     if variant == 0:
         paper_rgb = _multiply_ink_shape(
-            paper_rgb, lambda d: d.pieslice((-60, 680, 780, 1520), start=180, end=360, fill=highlight)
+            paper_rgb, lambda d: d.pieslice((-60, 810, 780, 1650), start=180, end=360, fill=highlight)
         )
         paper_rgb = _multiply_ink_shape(
-            paper_rgb, lambda d: d.ellipse((420, 700, 1220, 1500), fill=wash)
+            paper_rgb, lambda d: d.ellipse((420, 820, 1220, 1620), fill=wash)
         )
         paper_rgb = _multiply_ink_shape(
-            paper_rgb, lambda d: d.rounded_rectangle((76, 1020, 620, 1280), radius=12, fill=deep)
+            paper_rgb, lambda d: d.rounded_rectangle((76, 1080, 620, 1296), radius=12, fill=deep)
         )
     else:
         paper_rgb = _multiply_ink_shape(
-            paper_rgb, lambda d: d.rounded_rectangle((76, 700, 1004, 1276), radius=250, fill=wash)
+            paper_rgb, lambda d: d.rounded_rectangle((76, 820, 1004, 1296), radius=220, fill=wash)
         )
         paper_rgb = _multiply_ink_shape(
-            paper_rgb, lambda d: d.ellipse((500, 650, 1180, 1330), fill=highlight)
+            paper_rgb, lambda d: d.ellipse((500, 770, 1180, 1450), fill=highlight)
         )
         paper_rgb = _multiply_ink_shape(
-            paper_rgb, lambda d: d.ellipse((-120, 820, 560, 1500), fill=soft_accent)
+            paper_rgb, lambda d: d.ellipse((-120, 910, 560, 1590), fill=soft_accent)
         )
 
     canvas = paper_rgb.convert("RGBA")
@@ -455,21 +500,30 @@ def _render_riso_poster(
     margin_x = 76
     content_w = CARD_WIDTH - margin_x * 2
 
-    # Crisp Swiss rule + editorial section eyebrow above the headline.
-    draw.line((margin_x, 108, CARD_WIDTH - margin_x, 108), fill=(*INK_PRIMARY, 185), width=3)
+    draw.line((margin_x, 104, CARD_WIDTH - margin_x, 104), fill=(*INK_PRIMARY, 185), width=3)
     stamp_font = _load_font("semibold", 18)
     topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "AI BRIEF").upper()
-    draw.text((margin_x, 140), f"FOCUS  /  {topic_tag}", font=stamp_font, fill=(*INK_MUTED, 245))
+    draw.text((margin_x, 130), f"FOCUS  /  {topic_tag}", font=stamp_font, fill=(*INK_MUTED, 245))
 
     headline = _strip_invisible(topic["text"])
-    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 66, 56, font_weight="serif_bold")
+    h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 60, 52, font_weight="serif_bold")
     h_step = int(h_font.size * 1.13)
-    h_end = _draw_text_lines(draw, h_lines, margin_x, 184, h_step, h_font, (*INK_PRIMARY, 255))
+    h_end = _draw_text_lines(draw, h_lines, margin_x, 170, h_step, h_font, (*INK_PRIMARY, 255))
 
-    subhead = _build_subhead(topic, max_chars=210)
-    body_font = _load_font("regular", 30)
-    b_lines = _wrap_text(draw, subhead, body_font, content_w - 60, max_lines=4) if subhead else []
-    _draw_text_lines(draw, b_lines, margin_x, h_end + 28, 42, body_font, (*INK_SECONDARY, 240))
+    blocks = _build_body_blocks(topic, max_blocks=3)
+    body_font = _load_font("regular", 28)
+    _draw_paragraph_blocks(
+        draw,
+        blocks,
+        margin_x,
+        h_end + 26,
+        max_y=790,
+        width=content_w - 20,
+        font=body_font,
+        line_step=39,
+        fill=(*INK_SECONDARY, 242),
+        para_gap=18,
+    )
 
     return _apply_analog_grain(canvas, strength=0.45 + rng.uniform(0.0, 0.04))
 
@@ -480,7 +534,7 @@ def _render_editorial_horizon(
     seed: int,
     handle: str,
 ) -> Image.Image:
-    """Warm archival paper top centered copy fading into an organic grainy horizon."""
+    """Warm archival paper with rich centered brief over grainy horizon art."""
     accent, wash, deep, highlight = palette
     rng = random.Random(seed)
     mist = (
@@ -492,10 +546,10 @@ def _render_editorial_horizon(
     base = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (*PAPER_CREAM, 255))
     mist_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
     mist_x = rng.randint(620, 960) if seed % 2 == 0 else rng.randint(80, 420)
-    ImageDraw.Draw(mist_layer).ellipse((mist_x - 520, 440, mist_x + 560, 1080), fill=(*mist, 150))
+    ImageDraw.Draw(mist_layer).ellipse((mist_x - 520, 460, mist_x + 560, 1120), fill=(*mist, 150))
     base = Image.alpha_composite(base, mist_layer.filter(ImageFilter.GaussianBlur(radius=160)))
 
-    horizon_y = rng.randint(770, 810)
+    horizon_y = rng.randint(835, 875)
     phase = rng.uniform(0.0, math.tau)
     amp = rng.uniform(9.0, 18.0)
     slope = rng.uniform(-0.02, 0.02)
@@ -514,7 +568,7 @@ def _render_editorial_horizon(
         ]
 
     wave_main = wave(horizon_y, amp, 1.35, phase, slope)
-    wave_low = wave(horizon_y + 185, amp * 1.5, 1.15, phase + 1.1, -slope * 0.8)
+    wave_low = wave(horizon_y + 165, amp * 1.5, 1.15, phase + 1.1, -slope * 0.8)
 
     art = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
     ad = ImageDraw.Draw(art)
@@ -534,19 +588,35 @@ def _render_editorial_horizon(
 
     _draw_masthead(draw, topic, handle, accent, (*INK_SECONDARY, 235), (*INK_MUTED, 235))
     headline = _strip_invisible(topic["text"])
-    h_lines, h_font = _fit_headline_lines(draw, headline, 820, 68, 58, font_weight="serif")
+    h_lines, h_font = _fit_headline_lines(draw, headline, 860, 62, 52, font_weight="serif")
     h_step = int(h_font.size * 1.13)
 
-    subhead = _build_subhead(topic)
-    body_font = _load_font("regular", 30)
-    b_lines = _wrap_text(draw, subhead, body_font, 760, max_lines=4) if subhead else []
-    gap = 32 if b_lines else 0
-    block_h = len(h_lines) * h_step + gap + len(b_lines) * 42
-    start_y = max(148, 148 + (720 - 148 - block_h) // 2)
+    blocks = _build_body_blocks(topic, max_blocks=2)
+    body_font = _load_font("regular", 28)
+    body_step = 39
+    para_gap = 18
 
-    h_end = _draw_text_lines(draw, h_lines, 0, start_y, h_step, h_font, (*INK_PRIMARY, 255), centered=True)
-    if b_lines:
-        _draw_text_lines(draw, b_lines, 0, h_end + gap, 42, body_font, (*INK_SECONDARY, 245), centered=True)
+    # Measure full multi-paragraph copy so it fills the sky zone cleanly with even breathing room.
+    measured_lines: list[list[str]] = []
+    avail_lines = max(2, (790 - (140 + len(h_lines) * h_step + 28)) // body_step)
+    for block in blocks:
+        if avail_lines < 2:
+            break
+        wrapped = _wrap_text(draw, block, body_font, 820, max_lines=avail_lines)
+        measured_lines.append(wrapped)
+        avail_lines -= len(wrapped) + 1
+
+    body_h = sum(len(lines) * body_step for lines in measured_lines) + max(0, len(measured_lines) - 1) * para_gap
+    gap = 28 if measured_lines else 0
+    total_h = len(h_lines) * h_step + gap + body_h
+    start_y = max(136, 136 + (795 - 136 - total_h) // 2)
+
+    y = _draw_text_lines(draw, h_lines, 0, start_y, h_step, h_font, (*INK_PRIMARY, 255), centered=True)
+    if measured_lines:
+        y += gap
+        for lines in measured_lines:
+            y = _draw_text_lines(draw, lines, 0, y, body_step, body_font, (*INK_SECONDARY, 245), centered=True)
+            y += para_gap
     return canvas
 
 
