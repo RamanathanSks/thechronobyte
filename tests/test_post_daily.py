@@ -568,6 +568,125 @@ class DailyThreadsPostTests(unittest.TestCase):
             self.assertIn("#NVIDIA", caption_text)
             self.assertIn("Instagram Caption Preview", " ".join(logs.output))
 
+    def test_post_to_instagram_creates_polls_and_publishes_photo(self):
+        os.environ["IG_USER_ID"] = "17841400001234"
+        os.environ["IG_ACCESS_TOKEN"] = "test-ig-token"
+        post_resps = [
+            self.response({"id": "ig-container-1"}),
+            self.response({"id": "ig-media-999"}),
+        ]
+        get_resps = [
+            self.response({"id": "ig-container-1", "status_code": "IN_PROGRESS"}),
+            self.response({"id": "ig-container-1", "status_code": "FINISHED"}),
+        ]
+        with (
+            patch.object(bot.requests, "post", side_effect=post_resps) as post,
+            patch.object(bot.requests, "get", side_effect=get_resps) as get,
+            patch.object(bot.time, "sleep") as sleep,
+        ):
+            media_id = bot.post_to_instagram("https://example.com/card.jpg", "Test caption")
+        self.assertEqual(media_id, "ig-media-999")
+        sleep.assert_called_once_with(3.0)
+        self.assertEqual(post.call_args_list[0].args[0], f"{bot.INSTAGRAM_API_BASE}/17841400001234/media")
+        self.assertEqual(post.call_args_list[0].kwargs["data"]["image_url"], "https://example.com/card.jpg")
+        self.assertEqual(get.call_args_list[0].kwargs["params"], {"fields": "status_code,status"})
+        self.assertEqual(post.call_args_list[1].args[0], f"{bot.INSTAGRAM_API_BASE}/17841400001234/media_publish")
+
+    def test_instagram_container_error_raises_without_publish(self):
+        os.environ["IG_USER_ID"] = "17841400001234"
+        os.environ["IG_ACCESS_TOKEN"] = "test-ig-token"
+        with (
+            patch.object(bot.requests, "post", return_value=self.response({"id": "ig-c1"})) as post,
+            patch.object(bot.requests, "get", return_value=self.response({"status_code": "ERROR", "status": "Invalid aspect"})),
+        ):
+            with self.assertRaisesRegex(ValueError, "Invalid aspect"):
+                bot.post_to_instagram("https://example.com/card.jpg", "Caption")
+        post.assert_called_once()
+
+    def test_refresh_instagram_token_and_github_guard(self):
+        with patch.object(
+            bot.requests, "get", return_value=self.response({"access_token": "new-ig-tok", "expires_in": 5183944})
+        ) as get:
+            payload = bot.refresh_instagram_token("old-ig-tok")
+        self.assertEqual(payload["access_token"], "new-ig-tok")
+        self.assertEqual(get.call_args.kwargs["params"], {
+            "grant_type": "ig_refresh_token",
+            "access_token": "old-ig-tok",
+        })
+        os.environ["GITHUB_ACTIONS"] = "true"
+        os.environ["IG_ACCESS_TOKEN"] = "old-ig-tok"
+        self.assertEqual(bot.main(["--refresh-ig-token"]), 1)
+
+    def test_resolve_card_image_url_supports_imgbb_github_and_explicit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            card = Path(tmpdir) / "20261113-abcd1234.jpg"
+            card.write_bytes(b"fakejpegbytes")
+
+            with self.assertRaisesRegex(ValueError, "public HTTPS image host"):
+                bot._resolve_card_image_url(card)
+
+            os.environ["IMGBB_API_KEY"] = "imgbb-secret"
+            with patch.object(
+                bot.requests, "post", return_value=self.response({"data": {"url": "https://i.ibb.co/x/card.jpg"}})
+            ):
+                self.assertEqual(bot._resolve_card_image_url(card), "https://i.ibb.co/x/card.jpg")
+            del os.environ["IMGBB_API_KEY"]
+
+            os.environ["GITHUB_TOKEN"] = "gh-secret"
+            os.environ["GITHUB_REPOSITORY"] = "RamanathanSks/thechronobyte"
+            get_resps = [self.response({}, 404), self.response({}, 404)]
+            post_resps = [
+                self.response({"sha": "b1"}, 201),
+                self.response({"sha": "t1"}, 201),
+                self.response({"sha": "c1"}, 201),
+                self.response({"ref": "refs/heads/ig-media"}, 201),
+            ]
+            with (
+                patch.object(bot.requests, "get", side_effect=get_resps),
+                patch.object(bot.requests, "post", side_effect=post_resps),
+                patch.object(bot.requests, "put", return_value=self.response({"content": {"sha": "f1"}}, 201)),
+                patch.object(bot.time, "sleep"),
+            ):
+                raw_url = bot._resolve_card_image_url(card)
+            self.assertEqual(
+                raw_url,
+                "https://raw.githubusercontent.com/RamanathanSks/thechronobyte/ig-media/cards/20261113-abcd1234.jpg",
+            )
+
+            os.environ["IG_IMAGE_URL"] = "https://cdn.example.com/override.jpg"
+            self.assertEqual(bot._resolve_card_image_url(card), "https://cdn.example.com/override.jpg")
+
+    def test_main_dry_run_previews_both_and_live_isolates_failures_without_leaks(self):
+        os.environ["DRY_RUN"] = "true"
+        os.environ["ENABLE_INSTAGRAM"] = "true"
+        with (
+            patch.object(bot, "get_topic_of_the_day", return_value=self.topic),
+            patch.object(bot, "publish_thread") as pub_t,
+            patch.object(bot, "publish_instagram_card") as pub_ig,
+            self.assertLogs(bot.LOGGER, level="INFO") as logs,
+        ):
+            self.assertEqual(bot.main([]), 0)
+        pub_t.assert_not_called()
+        pub_ig.assert_not_called()
+        self.assertIn("no Instagram request made", " ".join(logs.output))
+
+        os.environ["DRY_RUN"] = "false"
+        os.environ["IG_ACCESS_TOKEN"] = "secret-ig-token"
+        err_resp = self.response({"error": {"code": 10, "message": "failed for secret-ig-token"}}, 403)
+        http_err = requests.HTTPError(response=err_resp)
+        with (
+            patch.object(bot, "get_topic_of_the_day", return_value=self.topic),
+            patch.object(bot, "publish_thread", return_value=["t-1"]),
+            patch.object(bot, "publish_instagram_card", side_effect=http_err),
+            self.assertLogs(bot.LOGGER, level="INFO") as logs,
+        ):
+            rc = bot.main([])
+        self.assertEqual(rc, 1)
+        combined = " ".join(logs.output)
+        self.assertIn("Posted successfully to Threads", combined)
+        self.assertIn("Instagram publish failed", combined)
+        self.assertNotIn("secret-ig-token", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

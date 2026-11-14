@@ -1,10 +1,12 @@
-"""Preview fresh AI/CPU/GPU/ML news from primary sources; optionally post to Meta Threads."""
+"""Preview fresh AI/CPU/GPU/ML news from primary sources; optionally post to Threads & Instagram."""
 
+import base64
 import hashlib
 import logging
 import os
 import re
 import sys
+import tempfile
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -53,6 +55,11 @@ GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 THREADS_API_BASE = "https://graph.threads.net/v1.0"
 THREADS_REFRESH_URL = "https://graph.threads.net/refresh_access_token"
+INSTAGRAM_API_BASE = "https://graph.instagram.com/v22.0"
+INSTAGRAM_REFRESH_URL = "https://graph.instagram.com/refresh_access_token"
+IMGBB_UPLOAD_URL = "https://api.imgbb.com/1/upload"
+GITHUB_API_BASE = "https://api.github.com"
+IG_MEDIA_BRANCH = "ig-media"
 MAX_POST_LENGTH = 500  # Threads text limit (checked conservatively in UTF-8 bytes).
 MAX_IG_CAPTION_LENGTH = 2200  # Instagram Graph API caption limit.
 IG_BODY_TARGET_LENGTH = 1400  # Keep mobile captions punchy before CTA + hashtags.
@@ -710,22 +717,26 @@ def generate_instagram_caption(topic: dict) -> str:
         return fallback
 
 
-def _require_threads_credentials() -> tuple[str, str]:
-    """Read and validate Threads credentials from the environment."""
-    user_id = os.getenv("THREADS_USER_ID", "").strip()
-    access_token = os.getenv("THREADS_ACCESS_TOKEN", "").strip()
-    missing = [
-        name for name, val in (
-            ("THREADS_USER_ID", user_id),
-            ("THREADS_ACCESS_TOKEN", access_token),
-        )
-        if not val
-    ]
+def _require_meta_credentials(user_env: str, token_env: str) -> tuple[str, str]:
+    """Read and validate a Meta platform user ID and access token from env vars."""
+    user_id = os.getenv(user_env, "").strip()
+    access_token = os.getenv(token_env, "").strip()
+    missing = [name for name, val in ((user_env, user_id), (token_env, access_token)) if not val]
     if missing:
         raise ValueError("Missing required environment variables: " + ", ".join(missing))
     if not USER_ID_PATTERN.match(user_id):
-        raise ValueError("THREADS_USER_ID must be a numeric ID or 'me'.")
+        raise ValueError(f"{user_env} must be a numeric ID or 'me'.")
     return user_id, access_token
+
+
+def _require_threads_credentials() -> tuple[str, str]:
+    """Read and validate Threads credentials from the environment."""
+    return _require_meta_credentials("THREADS_USER_ID", "THREADS_ACCESS_TOKEN")
+
+
+def _require_instagram_credentials() -> tuple[str, str]:
+    """Read and validate Instagram API with Instagram Login credentials."""
+    return _require_meta_credentials("IG_USER_ID", "IG_ACCESS_TOKEN")
 
 
 def _wait_for_container(
@@ -733,30 +744,34 @@ def _wait_for_container(
     access_token: str,
     max_attempts: int = 5,
     delay_seconds: float = 2.0,
+    base_url: str = THREADS_API_BASE,
+    fields: str = "status,error_message",
+    platform: str = "Threads",
 ) -> None:
-    """Wait briefly for Threads link/media container processing to finish."""
+    """Wait briefly for Meta media/link container processing to finish."""
     for attempt in range(max_attempts):
         resp = requests.get(
-            f"{THREADS_API_BASE}/{creation_id}",
-            params={"fields": "status,error_message"},
+            f"{base_url}/{creation_id}",
+            params={"fields": fields},
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         payload = resp.json()
-        status = str(payload.get("status", "")).upper()
+        raw_status = payload.get("status_code") if "status_code" in payload else payload.get("status", "")
+        status = str(raw_status or "").upper()
         if status in {"", "FINISHED", "PUBLISHED"}:
             return
         if status in {"ERROR", "EXPIRED"}:
-            detail = _clean_text(str(payload.get("error_message") or status))
-            raise ValueError(f"Threads container failed ({detail}).")
+            detail = _clean_text(str(payload.get("error_message") or payload.get("status") or status))
+            raise ValueError(f"{platform} container failed ({detail}).")
         if attempt < max_attempts - 1:
             time.sleep(delay_seconds)
-    raise ValueError("Threads container did not finish processing in time.")
+    raise ValueError(f"{platform} container did not finish processing in time.")
 
 
-def _safe_api_error_detail(error: requests.HTTPError, secret: str = "") -> str:
-    """Extract sanitized Meta error metadata without exposing credentials."""
+def _safe_api_error_detail(error: requests.HTTPError, *secrets: str) -> str:
+    """Extract sanitized API error metadata without exposing credentials."""
     if error.response is None:
         return ""
     try:
@@ -765,7 +780,10 @@ def _safe_api_error_detail(error: requests.HTTPError, secret: str = "") -> str:
         return ""
     err = payload.get("error") if isinstance(payload, dict) else None
     if not isinstance(err, dict):
-        return ""
+        msg = payload.get("message") if isinstance(payload, dict) else None
+        if not msg:
+            return ""
+        err = {"message": msg}
     parts = []
     if err.get("code") is not None:
         parts.append(f"code={err['code']}")
@@ -773,8 +791,9 @@ def _safe_api_error_detail(error: requests.HTTPError, secret: str = "") -> str:
         parts.append(f"subcode={err['error_subcode']}")
     if err.get("message"):
         msg = _clean_text(str(err["message"]))
-        if secret:
-            msg = msg.replace(secret, "[REDACTED]")
+        for secret in secrets:
+            if secret:
+                msg = msg.replace(secret, "[REDACTED]")
         parts.append(msg[:200])
     return ", ".join(parts)
 
@@ -854,21 +873,203 @@ def publish_thread(posts: list[str], link_url: str, topic_tag: str | None = None
     return published_ids
 
 
-def refresh_threads_token(access_token: str) -> dict:
-    """Extend a long-lived Threads user token by 60 days (must be >=24h old)."""
+def _refresh_meta_token(access_token: str, url: str, grant_type: str, label: str, env_name: str) -> dict:
+    """Extend a long-lived Meta user token by 60 days (must be >=24h old)."""
     token = access_token.strip()
     if not token:
-        raise ValueError("THREADS_ACCESS_TOKEN is required to refresh.")
+        raise ValueError(f"{env_name} is required to refresh.")
     response = requests.get(
-        THREADS_REFRESH_URL,
-        params={"grant_type": "th_refresh_token", "access_token": token},
+        url,
+        params={"grant_type": grant_type, "access_token": token},
         timeout=HTTP_TIMEOUT,
     )
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict) or not payload.get("access_token"):
-        raise ValueError("Threads refresh response did not include an access_token.")
+        raise ValueError(f"{label} refresh response did not include an access_token.")
     return payload
+
+
+def refresh_threads_token(access_token: str) -> dict:
+    """Extend a long-lived Threads user token by 60 days (must be >=24h old)."""
+    return _refresh_meta_token(
+        access_token, THREADS_REFRESH_URL, "th_refresh_token", "Threads", "THREADS_ACCESS_TOKEN"
+    )
+
+
+def refresh_instagram_token(access_token: str) -> dict:
+    """Extend a long-lived Instagram user token by 60 days (must be >=24h old)."""
+    return _refresh_meta_token(
+        access_token, INSTAGRAM_REFRESH_URL, "ig_refresh_token", "Instagram", "IG_ACCESS_TOKEN"
+    )
+
+
+def _upload_to_imgbb(card_path: Path, api_key: str) -> str:
+    """Upload rendered card JPEG to ImgBB (24h TTL) and return its direct HTTPS URL."""
+    encoded = base64.b64encode(card_path.read_bytes()).decode("ascii")
+    resp = requests.post(
+        IMGBB_UPLOAD_URL,
+        data={"key": api_key, "image": encoded, "name": card_path.stem, "expiration": "86400"},
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data") or {}
+    image_url = str(data.get("url") or "").strip()
+    if not image_url.startswith("https://"):
+        raise ValueError("ImgBB upload did not return an HTTPS image URL.")
+    return image_url
+
+
+def _ensure_github_media_branch(repo: str, headers: dict[str, str]) -> None:
+    """Ensure an orphan media branch exists in the public repo for transient card JPEGs."""
+    ref_url = f"{GITHUB_API_BASE}/repos/{repo}/git/ref/heads/{IG_MEDIA_BRANCH}"
+    ref_resp = requests.get(ref_url, headers=headers, timeout=HTTP_TIMEOUT)
+    if ref_resp.status_code == 200:
+        return
+    if ref_resp.status_code != 404:
+        ref_resp.raise_for_status()
+
+    blob_resp = requests.post(
+        f"{GITHUB_API_BASE}/repos/{repo}/git/blobs",
+        headers=headers,
+        json={"content": "", "encoding": "utf-8"},
+        timeout=HTTP_TIMEOUT,
+    )
+    blob_resp.raise_for_status()
+    tree_resp = requests.post(
+        f"{GITHUB_API_BASE}/repos/{repo}/git/trees",
+        headers=headers,
+        json={"tree": [{"path": ".keep", "mode": "100644", "type": "blob", "sha": blob_resp.json()["sha"]}]},
+        timeout=HTTP_TIMEOUT,
+    )
+    tree_resp.raise_for_status()
+    commit_resp = requests.post(
+        f"{GITHUB_API_BASE}/repos/{repo}/git/commits",
+        headers=headers,
+        json={"message": f"Initialize {IG_MEDIA_BRANCH} branch", "tree": tree_resp.json()["sha"], "parents": []},
+        timeout=HTTP_TIMEOUT,
+    )
+    commit_resp.raise_for_status()
+    create_ref = requests.post(
+        f"{GITHUB_API_BASE}/repos/{repo}/git/refs",
+        headers=headers,
+        json={"ref": f"refs/heads/{IG_MEDIA_BRANCH}", "sha": commit_resp.json()["sha"]},
+        timeout=HTTP_TIMEOUT,
+    )
+    if create_ref.status_code not in {200, 201, 422}:
+        create_ref.raise_for_status()
+
+
+def _upload_to_github_media(card_path: Path, repo: str, token: str) -> str:
+    """Push a unique card JPEG to the orphan ig-media branch and return raw HTTPS URL."""
+    if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
+        raise ValueError("GITHUB_REPOSITORY must be in 'owner/repo' format.")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    _ensure_github_media_branch(repo, headers)
+    rel_path = f"cards/{card_path.name}"
+    contents_url = f"{GITHUB_API_BASE}/repos/{repo}/contents/{rel_path}"
+    encoded = base64.b64encode(card_path.read_bytes()).decode("ascii")
+    payload: dict[str, str] = {
+        "message": f"Add Instagram card {card_path.name}",
+        "content": encoded,
+        "branch": IG_MEDIA_BRANCH,
+    }
+    existing = requests.get(contents_url, params={"ref": IG_MEDIA_BRANCH}, headers=headers, timeout=HTTP_TIMEOUT)
+    if existing.status_code == 200 and existing.json().get("sha"):
+        payload["sha"] = str(existing.json()["sha"])
+    put_resp = requests.put(contents_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+    put_resp.raise_for_status()
+    time.sleep(2.0)
+    return f"https://raw.githubusercontent.com/{repo}/{IG_MEDIA_BRANCH}/{rel_path}"
+
+
+def _resolve_card_image_url(card_path: Path) -> str:
+    """Provide a public HTTPS URL for a rendered card via IG_IMAGE_URL, ImgBB, or GitHub."""
+    explicit_url = os.getenv("IG_IMAGE_URL", "").strip()
+    if explicit_url:
+        if not explicit_url.startswith("https://"):
+            raise ValueError("IG_IMAGE_URL must start with https://.")
+        return explicit_url
+    imgbb_key = os.getenv("IMGBB_API_KEY", "").strip()
+    if imgbb_key:
+        return _upload_to_imgbb(card_path, imgbb_key)
+    gh_token = os.getenv("GITHUB_TOKEN", "").strip()
+    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+    if gh_token and repo:
+        return _upload_to_github_media(card_path, repo, gh_token)
+    raise ValueError(
+        "Instagram posting requires a public HTTPS image host: set IMGBB_API_KEY, "
+        "IG_IMAGE_URL, or run in GitHub Actions with GITHUB_TOKEN."
+    )
+
+
+def post_to_instagram(image_url: str, caption: str) -> str:
+    """Publish a JPEG photo post via Instagram API with Instagram Login (graph.instagram.com)."""
+    if not image_url.startswith("https://"):
+        raise ValueError("Instagram image_url must be a public HTTPS URL.")
+    if not caption.strip() or _post_weight(caption) > MAX_IG_CAPTION_LENGTH:
+        raise ValueError("Instagram caption must be non-empty and within 2,200 characters.")
+    user_id, access_token = _require_instagram_credentials()
+
+    container_resp = requests.post(
+        f"{INSTAGRAM_API_BASE}/{user_id}/media",
+        data={
+            "image_url": image_url,
+            "caption": caption,
+            "access_token": access_token,
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    container_resp.raise_for_status()
+    creation_id = container_resp.json().get("id")
+    if not creation_id:
+        raise ValueError("Instagram did not return a container ID.")
+
+    _wait_for_container(
+        str(creation_id),
+        access_token,
+        max_attempts=10,
+        delay_seconds=3.0,
+        base_url=INSTAGRAM_API_BASE,
+        fields="status_code,status",
+        platform="Instagram",
+    )
+
+    publish_resp = requests.post(
+        f"{INSTAGRAM_API_BASE}/{user_id}/media_publish",
+        data={
+            "creation_id": str(creation_id),
+            "access_token": access_token,
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    publish_resp.raise_for_status()
+    media_id = publish_resp.json().get("id")
+    if not media_id:
+        raise ValueError("Instagram did not return a media ID; check Instagram before retrying.")
+    return str(media_id)
+
+
+def publish_instagram_card(topic: dict, caption: str) -> str:
+    """Render the topic's 1080x1350 card, upload to public HTTPS storage, and publish to Instagram."""
+    from card_generator import render_news_card
+
+    slug = hashlib.sha256(topic["source_url"].encode("utf-8")).hexdigest()[:8]
+    filename = f"{topic['published']:%Y%m%d}-{slug}.jpg"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        card_path = render_news_card(topic, Path(tmpdir) / filename)
+        image_url = _resolve_card_image_url(card_path)
+    return post_to_instagram(image_url, caption)
+
+
+def _parse_bool_env(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be 'true' or 'false'.")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -876,10 +1077,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = argv if argv is not None else sys.argv[1:]
     try:
-        if args == ["--refresh-token"]:
+        if args in (["--refresh-token"], ["--refresh-ig-token"]):
             if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
                 raise ValueError("Refusing to print refreshed token in GitHub Actions logs; run locally.")
-            refreshed = refresh_threads_token(os.getenv("THREADS_ACCESS_TOKEN", ""))
+            if args == ["--refresh-ig-token"]:
+                refreshed = refresh_instagram_token(os.getenv("IG_ACCESS_TOKEN", ""))
+            else:
+                refreshed = refresh_threads_token(os.getenv("THREADS_ACCESS_TOKEN", ""))
             expires_in = refreshed.get("expires_in", "unknown")
             print(f"Refreshed token (expires_in={expires_in}s):\n{refreshed['access_token']}")
             return 0
@@ -902,51 +1106,91 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args:
-            raise ValueError("Unsupported arguments. Use no args, --refresh-token, or --save-card <path>.")
+            raise ValueError(
+                "Unsupported arguments. Use no args, --refresh-token, --refresh-ig-token, or --save-card <path>."
+            )
 
-        dry_run = os.getenv("DRY_RUN", "true").strip().lower()
-        if dry_run not in {"true", "false"}:
-            raise ValueError("DRY_RUN must be 'true' or 'false'.")
+        dry_run = _parse_bool_env("DRY_RUN", "true")
+        enable_threads = _parse_bool_env("ENABLE_THREADS", "true")
+        enable_instagram = _parse_bool_env("ENABLE_INSTAGRAM", "false")
 
         topic = get_topic_of_the_day()
         if topic is None:
             return 0
 
-        posts = generate_thread(topic)
+        posts = generate_thread(topic) if enable_threads == "true" else []
         topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
+        ig_caption = generate_instagram_caption(topic) if enable_instagram == "true" else ""
+
         if dry_run == "true":
-            preview = "\n\n--- [Reply in Thread] ---\n\n".join(posts)
-            LOGGER.info(
-                "DRY RUN: no Threads request made (%s part(s)). Post preview:\n%s\n[Topic: %s | Link card: %s]",
-                len(posts),
-                preview,
-                topic_tag,
-                topic["source_url"],
-            )
-        else:
-            post_ids = publish_thread(posts, topic["source_url"], topic_tag=topic_tag)
-            LOGGER.info(
-                "Posted successfully to Threads (%s part(s), root ID: %s, topic: %s).",
-                len(post_ids),
-                post_ids[0],
-                topic_tag,
-            )
-        return 0
+            if enable_threads == "true":
+                preview = "\n\n--- [Reply in Thread] ---\n\n".join(posts)
+                LOGGER.info(
+                    "DRY RUN: no Threads request made (%s part(s)). Post preview:\n%s\n[Topic: %s | Link card: %s]",
+                    len(posts),
+                    preview,
+                    topic_tag,
+                    topic["source_url"],
+                )
+            if enable_instagram == "true":
+                LOGGER.info(
+                    "DRY RUN: no Instagram request made. Caption preview (%s chars):\n%s",
+                    len(ig_caption),
+                    ig_caption,
+                )
+            return 0
+
+        errors = 0
+        if enable_threads == "true":
+            try:
+                post_ids = publish_thread(posts, topic["source_url"], topic_tag=topic_tag)
+                LOGGER.info(
+                    "Posted successfully to Threads (%s part(s), root ID: %s, topic: %s).",
+                    len(post_ids),
+                    post_ids[0],
+                    topic_tag,
+                )
+            except (requests.RequestException, ValueError) as error:
+                LOGGER.error("Threads publish failed: %s", _format_runtime_error(error))
+                errors += 1
+
+        if enable_instagram == "true":
+            try:
+                ig_id = publish_instagram_card(topic, ig_caption)
+                LOGGER.info("Posted successfully to Instagram (media ID: %s).", ig_id)
+            except (requests.RequestException, ValueError) as error:
+                LOGGER.error("Instagram publish failed: %s", _format_runtime_error(error))
+                errors += 1
+
+        return 0 if errors == 0 else 1
     except requests.HTTPError as error:
-        status = error.response.status_code if error.response is not None else "unknown"
-        detail = _safe_api_error_detail(error, os.getenv("THREADS_ACCESS_TOKEN", "").strip())
-        suffix = f" ({detail})" if detail else ""
-        LOGGER.error(
-            "Threads/API HTTP error (status %s)%s. Check token validity, permissions "
-            "(threads_basic, threads_content_publish), and tester status.",
-            status,
-            suffix,
-        )
+        LOGGER.error("%s", _format_runtime_error(error))
     except requests.RequestException:
-        LOGGER.error("API/network request failed. If publishing, check Threads before retrying.")
+        LOGGER.error("API/network request failed. Check Meta apps before retrying.")
     except ValueError as error:
         LOGGER.error("%s", error)
     return 1
+
+
+def _format_runtime_error(error: Exception) -> str:
+    """Format HTTP/network/validation errors cleanly without leaking any tokens or keys."""
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code if error.response is not None else "unknown"
+        detail = _safe_api_error_detail(
+            error,
+            os.getenv("THREADS_ACCESS_TOKEN", "").strip(),
+            os.getenv("IG_ACCESS_TOKEN", "").strip(),
+            os.getenv("IMGBB_API_KEY", "").strip(),
+            os.getenv("GITHUB_TOKEN", "").strip(),
+        )
+        suffix = f" ({detail})" if detail else ""
+        return (
+            f"Meta/API HTTP error (status {status}){suffix}. Check token validity, "
+            "permissions, and tester status."
+        )
+    if isinstance(error, requests.RequestException):
+        return "API/network request failed."
+    return str(error)
 
 
 if __name__ == "__main__":

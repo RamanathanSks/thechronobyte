@@ -1,4 +1,4 @@
-name: Daily AI and hardware news (Threads)
+name: Daily AI and hardware news (Threads & Instagram)
 
 on:
   schedule:
@@ -6,16 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Preview only (live posting also requires ENABLE_THREADS_POSTING=true)'
+        description: 'Preview only (live posting also requires ENABLE_*_POSTING=true)'
         type: boolean
         required: true
         default: true
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: daily-tech-news-threads
+  group: daily-tech-news-social
   cancel-in-progress: false
 
 jobs:
@@ -39,13 +39,19 @@ jobs:
       - name: Run offline tests
         run: python -m unittest discover -s tests -v
 
-      - name: Generate or post today's Thread
+      - name: Generate or post today's news
         env:
           PYTHONUTF8: '1'
           MAX_NEWS_AGE_HOURS: '72'
-          # Both schedules and manual runs preview unless live posting is enabled.
-          DRY_RUN: ${{ vars.ENABLE_THREADS_POSTING != 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+          # Both schedules and manual runs preview unless at least one platform is enabled and dry_run is false.
+          DRY_RUN: ${{ (vars.ENABLE_THREADS_POSTING != 'true' && vars.ENABLE_INSTAGRAM_POSTING != 'true') || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+          ENABLE_THREADS: ${{ vars.ENABLE_THREADS_POSTING == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+          ENABLE_INSTAGRAM: ${{ vars.ENABLE_INSTAGRAM_POSTING == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
           THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
           THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python post_daily.py
