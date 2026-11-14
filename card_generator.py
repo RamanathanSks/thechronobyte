@@ -1,13 +1,17 @@
 """Generate editorial 1080x1350 (4:5) JPEG news cards across rotating print themes."""
 
 import hashlib
+import logging
 import math
 from pathlib import Path
 import random
 import re
+import time
 import unicodedata
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+
+LOGGER = logging.getLogger(__name__)
 
 CARD_WIDTH = 1080
 CARD_HEIGHT = 1350
@@ -83,10 +87,18 @@ FONT_CANDIDATES = {
 }
 
 
-def _load_font(weight: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _resolve_font_path(weight: str) -> Path | None:
     for candidate in FONT_CANDIDATES.get(weight, ()):
-        if Path(candidate).is_file():
-            return ImageFont.truetype(candidate, size=size)
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    return None
+
+
+def _load_font(weight: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_path = _resolve_font_path(weight)
+    if font_path is not None:
+        return ImageFont.truetype(str(font_path), size=size)
     return ImageFont.load_default(size=size)
 
 
@@ -635,15 +647,48 @@ def render_news_card(
     theme: str | None = None,
 ) -> Path:
     """Render a 1080x1350 editorial JPEG card using one of four rotating print themes."""
+    started = time.monotonic()
     source = _strip_invisible(topic.get("source", "Tech News"))
     seed = _topic_seed(topic)
     palettes = SOURCE_PALETTES.get(source, DEFAULT_PALETTES)
-    palette = palettes[seed % len(palettes)]
+    palette_idx = seed % len(palettes)
+    palette = palettes[palette_idx]
 
-    chosen_theme = theme if theme in _THEME_RENDERERS else CARD_THEMES[seed % len(CARD_THEMES)]
+    if theme in _THEME_RENDERERS:
+        chosen_theme = theme
+        theme_mode = "explicit"
+    else:
+        chosen_theme = CARD_THEMES[seed % len(CARD_THEMES)]
+        theme_mode = "rotating"
+
+    serif_font = _resolve_font_path("serif_bold") or _resolve_font_path("serif")
+    sans_font = _resolve_font_path("regular")
+    body_blocks = _build_body_blocks(topic, max_blocks=3)
+    LOGGER.info(
+        "[4/6 Card] Rendering %dx%d JPEG | theme=%s (%s) | palette=%d/%d | source=%s | "
+        "body_blocks=%d | fonts=(serif=%s, sans=%s)",
+        CARD_WIDTH,
+        CARD_HEIGHT,
+        chosen_theme,
+        theme_mode,
+        palette_idx + 1,
+        len(palettes),
+        source,
+        len(body_blocks),
+        serif_font.name if serif_font else "pillow-default",
+        sans_font.name if sans_font else "pillow-default",
+    )
+
     canvas = _THEME_RENDERERS[chosen_theme](topic, palette, seed, handle)
 
     dest = Path(output_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     canvas.convert("RGB").save(dest, format="JPEG", quality=95, optimize=True)
+    size_kb = dest.stat().st_size / 1024.0
+    LOGGER.info(
+        "[4/6 Card] Saved JPEG %s (%.1f KB, %.2fs)",
+        dest,
+        size_kb,
+        time.monotonic() - started,
+    )
     return dest

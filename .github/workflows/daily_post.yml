@@ -39,9 +39,20 @@ jobs:
       - name: Run offline tests
         run: python -m unittest discover -s tests -v
 
+      - name: Log workflow run context
+        env:
+          DRY_RUN: ${{ (vars.ENABLE_THREADS_POSTING != 'true' && vars.ENABLE_INSTAGRAM_POSTING != 'true') || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+          ENABLE_THREADS: ${{ vars.ENABLE_THREADS_POSTING == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+          ENABLE_INSTAGRAM: ${{ vars.ENABLE_INSTAGRAM_POSTING == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          echo "Event: ${{ github.event_name }} | Ref: ${{ github.ref_name }} | SHA: ${{ github.sha }}"
+          echo "Variables: ENABLE_THREADS_POSTING=${{ vars.ENABLE_THREADS_POSTING || '<unset>' }}, ENABLE_INSTAGRAM_POSTING=${{ vars.ENABLE_INSTAGRAM_POSTING || '<unset>' }}"
+          echo "Resolved mode: DRY_RUN=${DRY_RUN}, ENABLE_THREADS=${ENABLE_THREADS}, ENABLE_INSTAGRAM=${ENABLE_INSTAGRAM}"
+
       - name: Generate or post today's news
         env:
           PYTHONUTF8: '1'
+          PYTHONUNBUFFERED: '1'
           MAX_NEWS_AGE_HOURS: '72'
           # Both schedules and manual runs preview unless at least one platform is enabled and dry_run is false.
           DRY_RUN: ${{ (vars.ENABLE_THREADS_POSTING != 'true' && vars.ENABLE_INSTAGRAM_POSTING != 'true') || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}

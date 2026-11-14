@@ -687,6 +687,66 @@ class DailyThreadsPostTests(unittest.TestCase):
         self.assertIn("Instagram publish failed", combined)
         self.assertNotIn("secret-ig-token", combined)
 
+    def test_step_summary_and_publish_instagram_card_logs_without_secret_leaks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.md"
+            os.environ.update({
+                "DRY_RUN": "true",
+                "ENABLE_THREADS": "true",
+                "ENABLE_INSTAGRAM": "true",
+                "THREADS_USER_ID": "12345",
+                "THREADS_ACCESS_TOKEN": "top-secret-threads",
+                "IG_USER_ID": "67890",
+                "IG_ACCESS_TOKEN": "top-secret-ig",
+                "GITHUB_TOKEN": "top-secret-gh",
+                "GITHUB_REPOSITORY": "RamanathanSks/thechronobyte",
+                "GROQ_API_KEY": "top-secret-groq",
+                "GITHUB_STEP_SUMMARY": str(summary_file),
+            })
+            with (
+                patch.object(bot, "get_topic_of_the_day", return_value=self.topic),
+                patch.object(bot, "generate_thread", return_value=["Part 1 hook?"]),
+                patch.object(bot, "generate_instagram_caption", return_value="Hook line\n\n#AI #TheChronoByte"),
+                self.assertLogs(level="INFO") as logs,
+            ):
+                rc = bot.main([])
+            self.assertEqual(rc, 0)
+            log_text = " ".join(logs.output)
+            self.assertIn("[0/6 Config]", log_text)
+            self.assertIn("[4/6 Card]", log_text)
+            self.assertIn("DRY RUN pipeline completed", log_text)
+            summary_text = summary_file.read_text(encoding="utf-8")
+            self.assertIn("Chrono Byte Daily Run (DRY RUN)", summary_text)
+            self.assertIn(self.topic["source_url"], summary_text)
+            for secret in ("top-secret-threads", "top-secret-ig", "top-secret-gh", "top-secret-groq"):
+                self.assertNotIn(secret, log_text)
+                self.assertNotIn(secret, summary_text)
+
+    def test_publish_instagram_card_logs_permalink_end_to_end(self):
+        os.environ.update({
+            "IG_USER_ID": "17841400001234",
+            "IG_ACCESS_TOKEN": "secret-ig-tok",
+            "IG_IMAGE_URL": "https://cdn.example.com/card.jpg",
+        })
+        post_resps = [
+            self.response({"id": "ig-c-1"}),
+            self.response({"id": "ig-m-42"}),
+        ]
+        get_resps = [
+            self.response({"status_code": "FINISHED"}),
+            self.response({"id": "ig-m-42", "permalink": "https://www.instagram.com/p/TEST123/"}),
+        ]
+        with (
+            patch.object(bot.requests, "post", side_effect=post_resps),
+            patch.object(bot.requests, "get", side_effect=get_resps),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            media_id = bot.publish_instagram_card(self.topic, "Caption body #TheChronoByte")
+        self.assertEqual(media_id, "ig-m-42")
+        combined = " ".join(logs.output)
+        self.assertIn("https://www.instagram.com/p/TEST123/", combined)
+        self.assertNotIn("secret-ig-tok", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

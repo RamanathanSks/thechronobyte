@@ -278,7 +278,9 @@ def _fetch_recent_thread_texts() -> list[str]:
     user_id = os.getenv("THREADS_USER_ID", "").strip()
     access_token = os.getenv("THREADS_ACCESS_TOKEN", "").strip()
     if not user_id or not access_token or not USER_ID_PATTERN.match(user_id):
+        LOGGER.info("[Dedup] Skipping Threads history check (THREADS credentials not configured).")
         return []
+    started = time.monotonic()
     try:
         resp = requests.get(
             f"{THREADS_API_BASE}/{user_id}/threads",
@@ -288,18 +290,27 @@ def _fetch_recent_thread_texts() -> list[str]:
         )
         resp.raise_for_status()
         data = resp.json().get("data", [])
-        return [
+        texts = [
             item["text"].lower()
             for item in data
             if isinstance(item, dict) and isinstance(item.get("text"), str)
         ]
-    except (requests.RequestException, ValueError, KeyError, TypeError):
-        LOGGER.warning("Could not fetch recent Threads posts for deduplication; continuing.")
+        LOGGER.info(
+            "[Dedup] Fetched %d recent Threads post(s) for deduplication (status=%s, %.2fs).",
+            len(texts),
+            resp.status_code,
+            time.monotonic() - started,
+        )
+        return texts
+    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+        LOGGER.warning("Could not fetch recent Threads posts for deduplication (%s); continuing.", type(error).__name__)
         return []
 
 
 def _fetch_article_paragraphs(url: str, allowed_host: str, contact: str) -> list[str]:
     """Best-effort extraction of opening paragraphs from the verified official URL."""
+    started = time.monotonic()
+    LOGGER.info("[2/6 Article] Fetching official article HTML for body context: %s", url)
     try:
         resp = requests.get(
             url,
@@ -309,15 +320,36 @@ def _fetch_article_paragraphs(url: str, allowed_host: str, contact: str) -> list
         resp.raise_for_status()
         final_host = urlsplit(resp.url).hostname if resp.url else allowed_host
         if final_host != allowed_host:
+            LOGGER.warning(
+                "[2/6 Article] Ignored redirected host %r (expected %r); continuing with RSS summary only.",
+                final_host,
+                allowed_host,
+            )
             return []
         content_type = resp.headers.get("Content-Type", "").lower()
         if content_type and "html" not in content_type:
+            LOGGER.info("[2/6 Article] Skipped non-HTML Content-Type=%r.", content_type)
             return []
+        html_snippet = resp.text[:MAX_ARTICLE_BYTES]
         parser = _ArticleParagraphExtractor()
-        parser.feed(resp.text[:MAX_ARTICLE_BYTES])
+        parser.feed(html_snippet)
         parser.close()
-        return parser.paragraphs[:4]
-    except (requests.RequestException, ValueError):
+        paragraphs = parser.paragraphs[:4]
+        char_counts = [len(p) for p in paragraphs]
+        LOGGER.info(
+            "[2/6 Article] Extracted %d paragraph(s) (chars=%s, html_bytes=%d, status=%s, %.2fs).",
+            len(paragraphs),
+            char_counts,
+            len(html_snippet),
+            resp.status_code,
+            time.monotonic() - started,
+        )
+        return paragraphs
+    except (requests.RequestException, ValueError) as error:
+        LOGGER.warning(
+            "[2/6 Article] Could not extract article HTML (%s); falling back to RSS summary.",
+            type(error).__name__,
+        )
         return []
 
 
@@ -333,7 +365,15 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
     stories = {}
     successful_feeds = 0
 
+    LOGGER.info(
+        "[1/6 Feeds] Scanning %d official RSS feeds | window=%dh | cutoff=%s",
+        len(NEWS_FEEDS),
+        hours,
+        cutoff.strftime("%Y-%m-%d %H:%M UTC"),
+    )
+
     for source, feed_url, allowed_host in NEWS_FEEDS:
+        feed_started = time.monotonic()
         try:
             response = requests.get(
                 feed_url,
@@ -344,31 +384,43 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
             root = ET.fromstring(response.content)
             if root.tag != "rss" or root.find("channel") is None:
                 raise ValueError("Not an RSS feed.")
-        except (requests.RequestException, ET.ParseError, ValueError):
-            LOGGER.warning("%s feed unavailable or invalid; continuing.", source)
+        except (requests.RequestException, ET.ParseError, ValueError) as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status is not None else type(error).__name__
+            LOGGER.warning("%s feed unavailable or invalid (%s, %.2fs); continuing.", source, detail, time.monotonic() - feed_started)
             continue
 
         successful_feeds += 1
-        for item in root.findall("./channel/item"):
+        items = root.findall("./channel/item")
+        kept = 0
+        skipped_topic = 0
+        skipped_age = 0
+        skipped_url = 0
+
+        for item in items:
             title = _clean_text(unescape(item.findtext("title", "")))
             link = item.findtext("link", "").strip()
             if not TOPIC_PATTERN.search(title) or FINANCIAL_PATTERN.search(title):
+                skipped_topic += 1
                 continue
             try:
                 published = parsedate_to_datetime(item.findtext("pubDate", ""))
                 url = urlsplit(link)
+                if published.tzinfo is None or not cutoff <= published <= now:
+                    skipped_age += 1
+                    continue
                 if (
-                    published.tzinfo is None
-                    or not cutoff <= published <= now
-                    or url.scheme != "https"
+                    url.scheme != "https"
                     or url.hostname != allowed_host
                     or url.username is not None
                     or url.password is not None
                     or url.port not in (None, 443)
                     or any(char.isspace() for char in link)
                 ):
+                    skipped_url += 1
                     continue
             except (TypeError, ValueError, OverflowError):
+                skipped_age += 1
                 continue
 
             raw_summary = item.findtext("description") or item.findtext(CONTENT_ENCODED_TAG) or ""
@@ -387,6 +439,21 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
             }
             story["topic_tag"] = _pick_topic_tag(story)
             stories[link] = story
+            kept += 1
+
+        LOGGER.info(
+            "[1/6 Feeds] %-18s | status=%s | payload=%.1fKB | items=%2d | kept=%2d | "
+            "skipped(topic=%d, age=%d, url=%d) | %.2fs",
+            source,
+            response.status_code,
+            len(response.content) / 1024.0,
+            len(items),
+            kept,
+            skipped_topic,
+            skipped_age,
+            skipped_url,
+            time.monotonic() - feed_started,
+        )
 
     if not successful_feeds:
         raise ValueError("All news feeds failed; no post generated.")
@@ -395,17 +462,50 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
         return None
 
     ranked = sorted(stories.values(), key=lambda s: (s["published"], s["source_url"]), reverse=True)
-    recent_texts = _fetch_recent_thread_texts()
-    topic = next(
-        (s for s in ranked if not any(s["text"].lower() in prev for prev in recent_texts)),
-        None,
+    LOGGER.info(
+        "[1/6 Feeds] Summary: %d/%d feeds healthy, %d qualifying story(ies) found. Top candidates:",
+        successful_feeds,
+        len(NEWS_FEEDS),
+        len(ranked),
     )
+    for idx, candidate in enumerate(ranked[:5], start=1):
+        age_hours = (now - candidate["published"]).total_seconds() / 3600.0
+        LOGGER.info(
+            "[1/6 Feeds]   #%d [%-18s | age=%.1fh | tag=%s] %s",
+            idx,
+            candidate["source"],
+            age_hours,
+            candidate["topic_tag"],
+            candidate["text"],
+        )
+
+    recent_texts = _fetch_recent_thread_texts()
+    topic = None
+    for candidate in ranked:
+        if any(candidate["text"].lower() in prev for prev in recent_texts):
+            LOGGER.info("[Dedup] Skipping already-posted story on Threads: %s", candidate["text"])
+            continue
+        topic = candidate
+        break
     if topic is None:
         LOGGER.info("All recent qualifying stories were already posted on Threads; skipping today.")
         return None
 
+    age_td = now - topic["published"]
+    age_hrs = int(age_td.total_seconds() // 3600)
+    age_mins = int((age_td.total_seconds() % 3600) // 60)
     topic["paragraphs"] = _fetch_article_paragraphs(topic["source_url"], topic["allowed_host"], contact)
-    LOGGER.info("Selected %s headline published %s.", topic["source"], topic["published"].isoformat())
+    LOGGER.info(
+        "Selected %s headline published %s (%dh %dm ago) | topic_tag=%s | summary=%d chars | paragraphs=%d | url=%s",
+        topic["source"],
+        topic["published"].isoformat(),
+        age_hrs,
+        age_mins,
+        topic["topic_tag"],
+        len(topic.get("summary") or ""),
+        len(topic["paragraphs"]),
+        topic["source_url"],
+    )
     return topic
 
 
@@ -562,8 +662,15 @@ def generate_thread(topic: dict) -> list[str]:
     fallback = _build_template_thread(topic)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
+        weights = [f"{_post_weight(p)}/{MAX_POST_LENGTH}" for p in fallback]
+        LOGGER.info(
+            "[3/6 Copy] Threads template ready | parts=%d | weights=%s (GROQ_API_KEY not set).",
+            len(fallback),
+            weights,
+        )
         return fallback
 
+    started = time.monotonic()
     source_material = _story_source_material(topic)
     system_prompt = (
         "Write a sharp, engaging, natural-sounding Threads post (or 2-part thread "
@@ -584,9 +691,21 @@ def generate_thread(topic: dict) -> list[str]:
             for p in parts
         ):
             raise ValueError("Groq response did not fit the Threads post format.")
+        weights = [f"{_post_weight(p)}/{MAX_POST_LENGTH}" for p in parts]
+        LOGGER.info(
+            "[3/6 Copy] Threads Groq (%s) ready | parts=%d | weights=%s | %.2fs.",
+            GROQ_MODEL,
+            len(parts),
+            weights,
+            time.monotonic() - started,
+        )
         return parts
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
-        LOGGER.warning("Groq unavailable or returned an invalid thread; using the template.")
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as error:
+        LOGGER.warning(
+            "Groq unavailable or returned an invalid thread (%s, %.2fs); using the template.",
+            type(error).__name__,
+            time.monotonic() - started,
+        )
         return fallback
 
 
@@ -683,8 +802,16 @@ def generate_instagram_caption(topic: dict) -> str:
     fallback = _build_instagram_caption_template(topic)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
+        first_line = fallback.splitlines()[0] if fallback else ""
+        LOGGER.info(
+            "[3/6 Copy] Instagram template caption ready | hook=%d/125 chars | total=%d/%d (GROQ_API_KEY not set).",
+            len(first_line),
+            len(fallback),
+            MAX_IG_CAPTION_LENGTH,
+        )
         return fallback
 
+    started = time.monotonic()
     footer = _instagram_footer(topic)
     body_budget = min(
         IG_BODY_TARGET_LENGTH,
@@ -711,9 +838,23 @@ def generate_instagram_caption(topic: dict) -> str:
             or _post_weight(body) > body_budget
         ):
             raise ValueError("Groq response did not fit the Instagram caption format.")
-        return f"{body}\n\n{footer}"
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
-        LOGGER.warning("Groq unavailable or returned an invalid Instagram caption; using the template.")
+        caption = f"{body}\n\n{footer}"
+        first_line = caption.splitlines()[0] if caption else ""
+        LOGGER.info(
+            "[3/6 Copy] Instagram Groq (%s) caption ready | hook=%d/125 chars | total=%d/%d | %.2fs.",
+            GROQ_MODEL,
+            len(first_line),
+            len(caption),
+            MAX_IG_CAPTION_LENGTH,
+            time.monotonic() - started,
+        )
+        return caption
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as error:
+        LOGGER.warning(
+            "Groq unavailable or returned an invalid Instagram caption (%s, %.2fs); using the template.",
+            type(error).__name__,
+            time.monotonic() - started,
+        )
         return fallback
 
 
@@ -760,6 +901,14 @@ def _wait_for_container(
         payload = resp.json()
         raw_status = payload.get("status_code") if "status_code" in payload else payload.get("status", "")
         status = str(raw_status or "").upper()
+        LOGGER.info(
+            "[6/6 %s] Container %s poll %d/%d -> status=%s",
+            platform,
+            creation_id,
+            attempt + 1,
+            max_attempts,
+            status or "OK",
+        )
         if status in {"", "FINISHED", "PUBLISHED"}:
             return
         if status in {"ERROR", "EXPIRED"}:
@@ -829,6 +978,15 @@ def post_to_threads(
         if clean_tag:
             container_payload["topic_tag"] = clean_tag
 
+    LOGGER.info(
+        "[6/6 Threads] Creating container | user=%s | kind=%s | weight=%d/%d | topic_tag=%s | link=%s",
+        user_id,
+        f"reply_to={reply_to_id}" if reply_to_id else "root",
+        _post_weight(post_text),
+        MAX_POST_LENGTH,
+        container_payload.get("topic_tag", "-"),
+        "yes" if link_url else "no",
+    )
     container_resp = requests.post(
         f"{THREADS_API_BASE}/{user_id}/threads",
         data=container_payload,
@@ -838,9 +996,11 @@ def post_to_threads(
     creation_id = container_resp.json().get("id")
     if not creation_id:
         raise ValueError("Threads did not return a container ID.")
+    LOGGER.info("[6/6 Threads] Created container ID=%s (HTTP %s).", creation_id, container_resp.status_code)
 
     _wait_for_container(str(creation_id), access_token)
 
+    LOGGER.info("[6/6 Threads] Publishing container ID=%s...", creation_id)
     publish_resp = requests.post(
         f"{THREADS_API_BASE}/{user_id}/threads_publish",
         data={
@@ -853,6 +1013,7 @@ def post_to_threads(
     post_id = publish_resp.json().get("id")
     if not post_id:
         raise ValueError("Threads did not return a post ID; check Threads before retrying.")
+    LOGGER.info("[6/6 Threads] Published post ID=%s (HTTP %s).", post_id, publish_resp.status_code)
     return str(post_id)
 
 
@@ -860,11 +1021,13 @@ def publish_thread(posts: list[str], link_url: str, topic_tag: str | None = None
     """Publish a 1- or 2-part Threads chain; root post failure raises, reply failure warns."""
     if not posts:
         raise ValueError("Thread must contain at least one post.")
+    LOGGER.info("[6/6 Threads] Publishing %d-part thread (topic_tag=%s)...", len(posts), topic_tag or "-")
     root_id = post_to_threads(posts[0], link_url=link_url, topic_tag=topic_tag)
     published_ids = [root_id]
     parent_id = root_id
-    for reply_text in posts[1:]:
+    for idx, reply_text in enumerate(posts[1:], start=2):
         try:
+            LOGGER.info("[6/6 Threads] Publishing part %d/%d in reply to %s...", idx, len(posts), parent_id)
             parent_id = post_to_threads(reply_text, reply_to_id=parent_id)
             published_ids.append(parent_id)
         except (requests.RequestException, ValueError):
@@ -906,7 +1069,10 @@ def refresh_instagram_token(access_token: str) -> dict:
 
 def _upload_to_imgbb(card_path: Path, api_key: str) -> str:
     """Upload rendered card JPEG to ImgBB (24h TTL) and return its direct HTTPS URL."""
-    encoded = base64.b64encode(card_path.read_bytes()).decode("ascii")
+    started = time.monotonic()
+    raw_bytes = card_path.read_bytes()
+    LOGGER.info("[5/6 Host] Uploading %s (%.1f KB) to ImgBB (expiration=86400s)...", card_path.name, len(raw_bytes) / 1024.0)
+    encoded = base64.b64encode(raw_bytes).decode("ascii")
     resp = requests.post(
         IMGBB_UPLOAD_URL,
         data={"key": api_key, "image": encoded, "name": card_path.stem, "expiration": "86400"},
@@ -917,6 +1083,7 @@ def _upload_to_imgbb(card_path: Path, api_key: str) -> str:
     image_url = str(data.get("url") or "").strip()
     if not image_url.startswith("https://"):
         raise ValueError("ImgBB upload did not return an HTTPS image URL.")
+    LOGGER.info("[5/6 Host] ImgBB upload OK (HTTP %s, %.2fs) -> %s", resp.status_code, time.monotonic() - started, image_url)
     return image_url
 
 
@@ -925,10 +1092,12 @@ def _ensure_github_media_branch(repo: str, headers: dict[str, str]) -> None:
     ref_url = f"{GITHUB_API_BASE}/repos/{repo}/git/ref/heads/{IG_MEDIA_BRANCH}"
     ref_resp = requests.get(ref_url, headers=headers, timeout=HTTP_TIMEOUT)
     if ref_resp.status_code == 200:
+        LOGGER.info("[5/6 Host] GitHub media branch '%s' exists in %s.", IG_MEDIA_BRANCH, repo)
         return
     if ref_resp.status_code != 404:
         ref_resp.raise_for_status()
 
+    LOGGER.info("[5/6 Host] Initializing orphan branch '%s' in %s...", IG_MEDIA_BRANCH, repo)
     blob_resp = requests.post(
         f"{GITHUB_API_BASE}/repos/{repo}/git/blobs",
         headers=headers,
@@ -958,10 +1127,12 @@ def _ensure_github_media_branch(repo: str, headers: dict[str, str]) -> None:
     )
     if create_ref.status_code not in {200, 201, 422}:
         create_ref.raise_for_status()
+    LOGGER.info("[5/6 Host] Orphan branch '%s' ready (HTTP %s).", IG_MEDIA_BRANCH, create_ref.status_code)
 
 
 def _upload_to_github_media(card_path: Path, repo: str, token: str) -> str:
     """Push a unique card JPEG to the orphan ig-media branch and return raw HTTPS URL."""
+    started = time.monotonic()
     if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
         raise ValueError("GITHUB_REPOSITORY must be in 'owner/repo' format.")
     headers = {
@@ -971,19 +1142,32 @@ def _upload_to_github_media(card_path: Path, repo: str, token: str) -> str:
     _ensure_github_media_branch(repo, headers)
     rel_path = f"cards/{card_path.name}"
     contents_url = f"{GITHUB_API_BASE}/repos/{repo}/contents/{rel_path}"
-    encoded = base64.b64encode(card_path.read_bytes()).decode("ascii")
+    raw_bytes = card_path.read_bytes()
+    encoded = base64.b64encode(raw_bytes).decode("ascii")
     payload: dict[str, str] = {
         "message": f"Add Instagram card {card_path.name}",
         "content": encoded,
         "branch": IG_MEDIA_BRANCH,
     }
     existing = requests.get(contents_url, params={"ref": IG_MEDIA_BRANCH}, headers=headers, timeout=HTTP_TIMEOUT)
+    action = "create"
     if existing.status_code == 200 and existing.json().get("sha"):
         payload["sha"] = str(existing.json()["sha"])
+        action = "update"
+    LOGGER.info(
+        "[5/6 Host] Pushing %s (%.1f KB, action=%s) to %s@%s...",
+        rel_path,
+        len(raw_bytes) / 1024.0,
+        action,
+        repo,
+        IG_MEDIA_BRANCH,
+    )
     put_resp = requests.put(contents_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
     put_resp.raise_for_status()
+    raw_url = f"https://raw.githubusercontent.com/{repo}/{IG_MEDIA_BRANCH}/{rel_path}"
+    LOGGER.info("[5/6 Host] Uploaded to GitHub (HTTP %s, %.2fs); waiting 2.0s for CDN propagation -> %s", put_resp.status_code, time.monotonic() - started, raw_url)
     time.sleep(2.0)
-    return f"https://raw.githubusercontent.com/{repo}/{IG_MEDIA_BRANCH}/{rel_path}"
+    return raw_url
 
 
 def _resolve_card_image_url(card_path: Path) -> str:
@@ -992,6 +1176,7 @@ def _resolve_card_image_url(card_path: Path) -> str:
     if explicit_url:
         if not explicit_url.startswith("https://"):
             raise ValueError("IG_IMAGE_URL must start with https://.")
+        LOGGER.info("[5/6 Host] Using explicit IG_IMAGE_URL -> %s", explicit_url)
         return explicit_url
     imgbb_key = os.getenv("IMGBB_API_KEY", "").strip()
     if imgbb_key:
@@ -1014,6 +1199,14 @@ def post_to_instagram(image_url: str, caption: str) -> str:
         raise ValueError("Instagram caption must be non-empty and within 2,200 characters.")
     user_id, access_token = _require_instagram_credentials()
 
+    LOGGER.info(
+        "[6/6 Instagram] Creating container | endpoint=%s/%s/media | caption=%d/%d chars | image_url=%s",
+        INSTAGRAM_API_BASE,
+        user_id,
+        len(caption),
+        MAX_IG_CAPTION_LENGTH,
+        image_url,
+    )
     container_resp = requests.post(
         f"{INSTAGRAM_API_BASE}/{user_id}/media",
         data={
@@ -1027,6 +1220,7 @@ def post_to_instagram(image_url: str, caption: str) -> str:
     creation_id = container_resp.json().get("id")
     if not creation_id:
         raise ValueError("Instagram did not return a container ID.")
+    LOGGER.info("[6/6 Instagram] Created container ID=%s (HTTP %s).", creation_id, container_resp.status_code)
 
     _wait_for_container(
         str(creation_id),
@@ -1038,6 +1232,7 @@ def post_to_instagram(image_url: str, caption: str) -> str:
         platform="Instagram",
     )
 
+    LOGGER.info("[6/6 Instagram] Publishing container ID=%s via media_publish...", creation_id)
     publish_resp = requests.post(
         f"{INSTAGRAM_API_BASE}/{user_id}/media_publish",
         data={
@@ -1050,7 +1245,27 @@ def post_to_instagram(image_url: str, caption: str) -> str:
     media_id = publish_resp.json().get("id")
     if not media_id:
         raise ValueError("Instagram did not return a media ID; check Instagram before retrying.")
+    LOGGER.info("[6/6 Instagram] Published media ID=%s (HTTP %s).", media_id, publish_resp.status_code)
     return str(media_id)
+
+
+def _fetch_instagram_permalink(media_id: str) -> str | None:
+    """Best-effort lookup of the published Instagram permalink for operator logs."""
+    access_token = os.getenv("IG_ACCESS_TOKEN", "").strip()
+    if not access_token:
+        return None
+    try:
+        resp = requests.get(
+            f"{INSTAGRAM_API_BASE}/{media_id}",
+            params={"fields": "id,permalink"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        permalink = str(resp.json().get("permalink") or "").strip()
+        return permalink or None
+    except Exception:
+        return None
 
 
 def publish_instagram_card(topic: dict, caption: str) -> str:
@@ -1062,7 +1277,11 @@ def publish_instagram_card(topic: dict, caption: str) -> str:
     with tempfile.TemporaryDirectory() as tmpdir:
         card_path = render_news_card(topic, Path(tmpdir) / filename)
         image_url = _resolve_card_image_url(card_path)
-    return post_to_instagram(image_url, caption)
+    media_id = post_to_instagram(image_url, caption)
+    permalink = _fetch_instagram_permalink(media_id)
+    if permalink:
+        LOGGER.info("[6/6 Instagram] Live post permalink: %s", permalink)
+    return media_id
 
 
 def _parse_bool_env(name: str, default: str) -> str:
@@ -1072,9 +1291,102 @@ def _parse_bool_env(name: str, default: str) -> str:
     return value
 
 
+def _configure_logging() -> None:
+    """Configure UTC-timestamped console logging for both local runs and GitHub Actions."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S UTC",
+    )
+    for handler in logging.getLogger().handlers:
+        if handler.formatter is not None:
+            handler.formatter.converter = time.gmtime
+
+
+def _describe_image_host() -> str:
+    """Describe which public HTTPS image host will be used without revealing any keys."""
+    if os.getenv("IG_IMAGE_URL", "").strip():
+        return "explicit IG_IMAGE_URL"
+    if os.getenv("IMGBB_API_KEY", "").strip():
+        return "ImgBB (24h TTL)"
+    if os.getenv("GITHUB_TOKEN", "").strip() and os.getenv("GITHUB_REPOSITORY", "").strip():
+        return f"GitHub branch '{IG_MEDIA_BRANCH}' ({os.getenv('GITHUB_REPOSITORY', '').strip()})"
+    return "NONE (set GITHUB_TOKEN+GITHUB_REPOSITORY, IMGBB_API_KEY, or IG_IMAGE_URL)"
+
+
+def _log_pipeline_config(dry_run: str, enable_threads: str, enable_instagram: str) -> None:
+    """Log non-secret runtime configuration at startup so every run is self-explanatory."""
+    threads_creds = bool(os.getenv("THREADS_USER_ID", "").strip() and os.getenv("THREADS_ACCESS_TOKEN", "").strip())
+    ig_creds = bool(os.getenv("IG_USER_ID", "").strip() and os.getenv("IG_ACCESS_TOKEN", "").strip())
+    groq_enabled = bool(os.getenv("GROQ_API_KEY", "").strip())
+    gh_actions = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+    LOGGER.info(
+        "[0/6 Config] mode=%s | Threads=%s (creds=%s) | Instagram=%s (creds=%s) | "
+        "lookback=%sh | Groq=%s | image_host=%s | github_actions=%s",
+        "DRY_RUN (preview only)" if dry_run == "true" else "LIVE",
+        "ON" if enable_threads == "true" else "OFF",
+        "present" if threads_creds else "missing",
+        "ON" if enable_instagram == "true" else "OFF",
+        "present" if ig_creds else "missing",
+        os.getenv("MAX_NEWS_AGE_HOURS", "72"),
+        f"enabled ({GROQ_MODEL})" if groq_enabled else "disabled (template mode)",
+        _describe_image_host(),
+        "yes" if gh_actions else "no",
+    )
+
+
+def _write_github_step_summary(
+    *,
+    dry_run: bool,
+    elapsed_s: float,
+    topic: dict | None,
+    threads_status: str,
+    ig_status: str,
+    posts: list[str],
+    ig_caption: str,
+) -> None:
+    """Append a structured Markdown run summary to $GITHUB_STEP_SUMMARY when available."""
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY", "").strip()
+    if not summary_path:
+        return
+    lines = [
+        f"## Chrono Byte Daily Run ({'DRY RUN' if dry_run else 'LIVE'})",
+        "",
+        f"- **Duration:** `{elapsed_s:.2f}s`",
+        f"- **Threads:** {threads_status}",
+        f"- **Instagram:** {ig_status}",
+    ]
+    if topic is not None:
+        lines.extend([
+            f"- **Story:** [{topic['source']}] {topic['text']}",
+            f"- **Published:** `{topic['published'].isoformat()}` | **Tag:** `{topic.get('topic_tag', '')}`",
+            f"- **Source URL:** {topic['source_url']}",
+        ])
+    if posts:
+        lines.extend(["", "### Threads Preview", ""])
+        for idx, part in enumerate(posts, start=1):
+            lines.extend([f"**Part {idx}/{len(posts)}** ({_post_weight(part)}/{MAX_POST_LENGTH} weight):", "", "```text", part, "```", ""])
+    if ig_caption:
+        lines.extend([
+            "",
+            f"### Instagram Caption ({len(ig_caption)}/{MAX_IG_CAPTION_LENGTH} chars)",
+            "",
+            "```text",
+            ig_caption,
+            "```",
+            "",
+        ])
+    try:
+        with Path(summary_path).open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except OSError as error:
+        LOGGER.warning("Could not write GITHUB_STEP_SUMMARY (%s).", type(error).__name__)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one daily cycle; missing DRY_RUN always means preview."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    _configure_logging()
+    started = time.monotonic()
     args = argv if argv is not None else sys.argv[1:]
     try:
         if args in (["--refresh-token"], ["--refresh-ig-token"]):
@@ -1092,6 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
 
             topic = get_topic_of_the_day()
             if topic is None:
+                LOGGER.info("Pipeline completed in %.2fs (no story to save).", time.monotonic() - started)
                 return 0
             out_path = Path(render_news_card(topic, args[1]))
             caption = generate_instagram_caption(topic)
@@ -1104,6 +1417,7 @@ def main(argv: list[str] | None = None) -> int:
                 len(caption),
                 caption,
             )
+            LOGGER.info("Pipeline completed in %.2fs.", time.monotonic() - started)
             return 0
         if args:
             raise ValueError(
@@ -1113,9 +1427,20 @@ def main(argv: list[str] | None = None) -> int:
         dry_run = _parse_bool_env("DRY_RUN", "true")
         enable_threads = _parse_bool_env("ENABLE_THREADS", "true")
         enable_instagram = _parse_bool_env("ENABLE_INSTAGRAM", "false")
+        _log_pipeline_config(dry_run, enable_threads, enable_instagram)
 
         topic = get_topic_of_the_day()
         if topic is None:
+            _write_github_step_summary(
+                dry_run=(dry_run == "true"),
+                elapsed_s=time.monotonic() - started,
+                topic=None,
+                threads_status="Skipped (no fresh unposted story)",
+                ig_status="Skipped (no fresh unposted story)",
+                posts=[],
+                ig_caption="",
+            )
+            LOGGER.info("Pipeline completed in %.2fs (no qualifying story).", time.monotonic() - started)
             return 0
 
         posts = generate_thread(topic) if enable_threads == "true" else []
@@ -1133,17 +1458,35 @@ def main(argv: list[str] | None = None) -> int:
                     topic["source_url"],
                 )
             if enable_instagram == "true":
+                from card_generator import render_news_card
+
+                slug = hashlib.sha256(topic["source_url"].encode("utf-8")).hexdigest()[:8]
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    render_news_card(topic, Path(tmpdir) / f"{topic['published']:%Y%m%d}-{slug}.jpg")
                 LOGGER.info(
                     "DRY RUN: no Instagram request made. Caption preview (%s chars):\n%s",
                     len(ig_caption),
                     ig_caption,
                 )
+            _write_github_step_summary(
+                dry_run=True,
+                elapsed_s=time.monotonic() - started,
+                topic=topic,
+                threads_status="Previewed (dry run)" if enable_threads == "true" else "Disabled",
+                ig_status="Card rendered + caption previewed (dry run)" if enable_instagram == "true" else "Disabled",
+                posts=posts,
+                ig_caption=ig_caption,
+            )
+            LOGGER.info("DRY RUN pipeline completed in %.2fs.", time.monotonic() - started)
             return 0
 
         errors = 0
+        threads_status = "Disabled"
+        ig_status = "Disabled"
         if enable_threads == "true":
             try:
                 post_ids = publish_thread(posts, topic["source_url"], topic_tag=topic_tag)
+                threads_status = f"Published (`{', '.join(post_ids)}`)"
                 LOGGER.info(
                     "Posted successfully to Threads (%s part(s), root ID: %s, topic: %s).",
                     len(post_ids),
@@ -1151,17 +1494,33 @@ def main(argv: list[str] | None = None) -> int:
                     topic_tag,
                 )
             except (requests.RequestException, ValueError) as error:
-                LOGGER.error("Threads publish failed: %s", _format_runtime_error(error))
+                detail = _format_runtime_error(error)
+                threads_status = f"Failed ({detail})"
+                LOGGER.error("Threads publish failed: %s", detail)
                 errors += 1
 
         if enable_instagram == "true":
             try:
                 ig_id = publish_instagram_card(topic, ig_caption)
+                ig_status = f"Published (media ID `{ig_id}`)"
                 LOGGER.info("Posted successfully to Instagram (media ID: %s).", ig_id)
             except (requests.RequestException, ValueError) as error:
-                LOGGER.error("Instagram publish failed: %s", _format_runtime_error(error))
+                detail = _format_runtime_error(error)
+                ig_status = f"Failed ({detail})"
+                LOGGER.error("Instagram publish failed: %s", detail)
                 errors += 1
 
+        elapsed = time.monotonic() - started
+        _write_github_step_summary(
+            dry_run=False,
+            elapsed_s=elapsed,
+            topic=topic,
+            threads_status=threads_status,
+            ig_status=ig_status,
+            posts=posts,
+            ig_caption=ig_caption,
+        )
+        LOGGER.info("LIVE pipeline completed in %.2fs (errors=%d).", elapsed, errors)
         return 0 if errors == 0 else 1
     except requests.HTTPError as error:
         LOGGER.error("%s", _format_runtime_error(error))
@@ -1182,6 +1541,7 @@ def _format_runtime_error(error: Exception) -> str:
             os.getenv("IG_ACCESS_TOKEN", "").strip(),
             os.getenv("IMGBB_API_KEY", "").strip(),
             os.getenv("GITHUB_TOKEN", "").strip(),
+            os.getenv("GROQ_API_KEY", "").strip(),
         )
         suffix = f" ({detail})" if detail else ""
         return (
