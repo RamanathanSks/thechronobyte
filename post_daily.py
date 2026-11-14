@@ -173,11 +173,11 @@ class _ArticleParagraphExtractor(HTMLParser):
 
 
 def _clean_text(text: str) -> str:
-    """Normalize whitespace/Unicode and drop surrogates or BOM markers."""
+    """Normalize whitespace/Unicode and drop surrogates or invisible format characters."""
     text = unicodedata.normalize("NFC", text)
     text = "".join(
         char for char in text
-        if char not in "\ufeff\ufffe\uffff" and unicodedata.category(char) != "Cs"
+        if char not in "\ufeff\ufffe\uffff" and unicodedata.category(char) not in {"Cs", "Cf"}
     )
     return " ".join(text.split())
 
@@ -718,8 +718,17 @@ def main(argv: list[str] | None = None) -> int:
             expires_in = refreshed.get("expires_in", "unknown")
             print(f"Refreshed token (expires_in={expires_in}s):\n{refreshed['access_token']}")
             return 0
+        if len(args) == 2 and args[0] == "--save-card":
+            from card_generator import render_news_card
+
+            topic = get_topic_of_the_day()
+            if topic is None:
+                return 0
+            out_path = render_news_card(topic, args[1])
+            LOGGER.info("Saved preview card to %s (no posts sent).", out_path)
+            return 0
         if args:
-            raise ValueError("Unsupported arguments. Use no args or --refresh-token.")
+            raise ValueError("Unsupported arguments. Use no args, --refresh-token, or --save-card <path>.")
 
         dry_run = os.getenv("DRY_RUN", "true").strip().lower()
         if dry_run not in {"true", "false"}:
