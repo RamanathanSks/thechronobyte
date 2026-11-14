@@ -1,49 +1,77 @@
 """Generate editorial 1080x1350 (4:5) JPEG news cards for Instagram & Threads."""
 
+import hashlib
+import math
 from pathlib import Path
+import random
+import re
 import unicodedata
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 CARD_WIDTH = 1080
 CARD_HEIGHT = 1350
 
-SOURCE_ACCENTS = {
-    "OpenAI": (16, 163, 127),            # #10A37F
-    "NVIDIA": (118, 185, 0),             # #76B900
-    "Google AI": (66, 133, 244),         # #4285F4
-    "AMD": (237, 28, 36),                # #ED1C24
-    "Microsoft Research": (0, 164, 239), # #00A4EF
+PAPER_COLOR = (244, 241, 232)
+INK_PRIMARY = (20, 22, 24)
+INK_SECONDARY = (50, 53, 56)
+INK_MUTED = (122, 118, 110)
+
+# Curated atmospheric color palettes per source: (accent_dot, mist_tint, horizon_dark, primary_wash, warm_bloom).
+SOURCE_PALETTES = {
+    "OpenAI": (
+        ((16, 163, 127), (146, 198, 182), (24, 62, 58), (212, 148, 72), (235, 198, 126)),
+        ((16, 163, 127), (154, 188, 194), (30, 52, 74), (88, 152, 138), (228, 182, 108)),
+    ),
+    "NVIDIA": (
+        ((102, 168, 0), (168, 196, 142), (28, 56, 26), (168, 178, 74), (226, 208, 120)),
+        ((102, 168, 0), (148, 188, 168), (22, 48, 52), (96, 156, 98), (214, 192, 104)),
+    ),
+    "Google AI": (
+        ((56, 118, 228), (156, 186, 218), (28, 46, 86), (214, 138, 68), (236, 198, 124)),
+        ((56, 118, 228), (164, 198, 206), (34, 64, 88), (104, 154, 204), (226, 184, 118)),
+    ),
+    "AMD": (
+        ((216, 42, 42), (206, 170, 154), (72, 26, 28), (208, 114, 58), (236, 188, 118)),
+        ((216, 42, 42), (190, 178, 168), (54, 34, 42), (176, 88, 66), (228, 172, 112)),
+    ),
+    "Microsoft Research": (
+        ((0, 142, 214), (152, 192, 216), (24, 48, 82), (126, 168, 206), (226, 192, 128)),
+        ((0, 142, 214), (164, 196, 192), (26, 58, 72), (198, 144, 78), (232, 198, 136)),
+    ),
 }
-DEFAULT_ACCENT = (99, 102, 241)
+DEFAULT_PALETTES = (
+    ((78, 92, 208), (166, 186, 212), (32, 42, 74), (196, 136, 74), (232, 194, 126)),
+)
 
 FONT_CANDIDATES = {
-    "bold": (
-        "C:/Windows/Fonts/segoeuib.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+    "serif": (
+        "C:/Windows/Fonts/georgia.ttf",
+        "C:/Windows/Fonts/pala.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+    ),
+    "serif_bold": (
+        "C:/Windows/Fonts/georgiab.ttf",
+        "C:/Windows/Fonts/palab.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
     ),
     "semibold": (
         "C:/Windows/Fonts/seguisb.ttf",
         "C:/Windows/Fonts/segoeuib.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     ),
     "regular": (
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-    ),
-    "mono": (
-        "C:/Windows/Fonts/consolab.ttf",
-        "C:/Windows/Fonts/consola.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
     ),
 }
 
@@ -86,7 +114,6 @@ def _wrap_text(
                 truncated = True
                 current = ""
                 break
-        # Handle single ultra-long token cleanly.
         if _text_width(draw, word, font) > max_width:
             clipped = word
             while len(clipped) > 1 and _text_width(draw, clipped + "…", font) > max_width:
@@ -108,50 +135,6 @@ def _wrap_text(
     return lines
 
 
-def _draw_background(accent: tuple[int, int, int]) -> Image.Image:
-    """Create dark obsidian canvas with soft source-colored glow and subtle dot grid."""
-    base = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (10, 13, 20, 255))
-
-    glow_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
-    glow_draw = ImageDraw.Draw(glow_layer)
-    # Top-right primary glow + bottom-left secondary glow.
-    glow_draw.ellipse((540, -180, 1260, 540), fill=(*accent, 52))
-    glow_draw.ellipse((-240, 880, 440, 1520), fill=(*accent, 34))
-    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=140))
-    base = Image.alpha_composite(base, glow_layer)
-
-    grid_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
-    grid_draw = ImageDraw.Draw(grid_layer)
-    for x in range(48, CARD_WIDTH, 48):
-        for y in range(48, CARD_HEIGHT, 48):
-            grid_draw.rectangle((x, y, x + 1, y + 1), fill=(255, 255, 255, 16))
-    base = Image.alpha_composite(base, grid_layer)
-    return base
-
-
-def _draw_pill(
-    draw: ImageDraw.ImageDraw,
-    xy: tuple[int, int],
-    label: str,
-    font: ImageFont.ImageFont,
-    fill: tuple[int, int, int, int],
-    outline: tuple[int, int, int, int] | None,
-    text_fill: tuple[int, int, int, int],
-    pad_x: int = 22,
-    pad_y: int = 11,
-) -> int:
-    """Draw a rounded badge pill and return its right edge x-coordinate."""
-    x, y = xy
-    bbox = draw.textbbox((0, 0), label, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    w = tw + pad_x * 2
-    h = th + pad_y * 2
-    draw.rounded_rectangle((x, y, x + w, y + h), radius=h // 2, fill=fill, outline=outline, width=2)
-    draw.text((x + pad_x - bbox[0], y + pad_y - bbox[1]), label, font=font, fill=text_fill)
-    return x + w
-
-
 def _strip_invisible(text: str) -> str:
     """Remove format/control chars (e.g. U+2060 word joiner) that render as boxes."""
     return " ".join(
@@ -159,17 +142,23 @@ def _strip_invisible(text: str) -> str:
     )
 
 
-def _build_body_paragraphs(topic: dict) -> list[str]:
-    """Select clean readable context paragraphs distinct from the headline."""
+def _topic_seed(topic: dict) -> int:
+    key = f"{topic.get('published', '')}|{topic.get('source_url', '')}|{topic.get('text', '')}"
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:12], 16)
+
+
+def _build_subhead(topic: dict, max_chars: int = 210) -> str:
+    """Select one crisp 2-4 line editorial subheadline distinct from the headline."""
     title_low = _strip_invisible(topic["text"]).lower()
     raw_items = list(topic.get("paragraphs") or [])
     summary = (topic.get("summary") or "").strip()
     if summary:
         raw_items.append(summary)
 
-    selected: list[str] = []
+    chosen = ""
     for item in raw_items:
         cleaned = _strip_invisible(item).rstrip("…")
+        cleaned = re.sub(r"\s*(?:\[\u2026\]|\[\.\.\.\]|…)$", "", cleaned).strip()
         if not cleaned or len(cleaned) < 25:
             continue
         low = cleaned.lower()
@@ -179,116 +168,210 @@ def _build_body_paragraphs(topic: dict) -> list[str]:
             cleaned = cleaned[len(title_low):].lstrip(" ,:—-")
             if cleaned:
                 cleaned = cleaned[0].upper() + cleaned[1:]
-                low = cleaned.lower()
-        joined = " ".join(selected).lower()
-        if low in joined or low[:55] in joined:
-            continue
-        selected.append(cleaned)
-        if len(selected) == 2:
-            break
-    return selected
+        chosen = cleaned
+        break
+
+    if not chosen:
+        return ""
+    if len(chosen) <= max_chars:
+        return chosen
+    clipped = chosen[:max_chars]
+    for sep in (". ", "! ", "? "):
+        idx = clipped.rfind(sep)
+        if idx >= 70:
+            return clipped[: idx + 1].strip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.rstrip(" ,;:-") + "…"
+
+
+def _apply_analog_grain(image: Image.Image, seed: int) -> Image.Image:
+    """Blend crisp tactile analog film/riso grain across the canvas."""
+    base_rgb = image.convert("RGB")
+    fine = Image.effect_noise((CARD_WIDTH, CARD_HEIGHT), 26).convert("RGB")
+    med = Image.effect_noise((CARD_WIDTH // 2, CARD_HEIGHT // 2), 28).resize(
+        (CARD_WIDTH, CARD_HEIGHT), resample=Image.Resampling.BILINEAR
+    ).convert("RGB")
+    grain = Image.blend(fine, med, alpha=0.38)
+
+    rng = random.Random(seed)
+    grain_mix = 0.44 + rng.uniform(0.0, 0.06)
+    soft = ImageChops.soft_light(base_rgb, grain)
+    return Image.blend(base_rgb, soft, alpha=grain_mix).convert("RGBA")
+
+
+def _build_wave(
+    base_y: float,
+    amp: float,
+    freq: float,
+    phase: float,
+    slope: float,
+    offset_jitter: list[float] | None = None,
+) -> list[tuple[int, int]]:
+    """Build smooth organic horizon contour points across the full card width."""
+    pts: list[tuple[int, int]] = []
+    step = 20
+    for idx, x in enumerate(range(0, CARD_WIDTH + step, step)):
+        cx = min(x, CARD_WIDTH)
+        t = cx / CARD_WIDTH
+        y = (
+            base_y
+            + slope * (cx - CARD_WIDTH / 2)
+            + amp * math.sin(t * math.pi * freq + phase)
+            + (amp * 0.38) * math.cos(t * math.pi * (freq * 2.1) - phase * 0.7)
+        )
+        if offset_jitter and idx < len(offset_jitter):
+            y += offset_jitter[idx]
+        pts.append((cx, int(y)))
+    return pts
+
+
+def _draw_editorial_background(
+    palette: tuple[tuple[int, int, int], ...],
+    seed: int,
+) -> Image.Image:
+    """Create warm archival paper top fading into organic painterly horizon art."""
+    _, mist, horizon_dark, wash, bloom = palette
+    rng = random.Random(seed)
+
+    base = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (*PAPER_COLOR, 255))
+
+    # 1. Soft atmospheric mist sweeping diagonally from lower right or lower left behind text.
+    mist_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    mist_draw = ImageDraw.Draw(mist_layer)
+    mist_x = rng.randint(640, 960) if seed % 2 == 0 else rng.randint(80, 420)
+    mist_draw.ellipse((mist_x - 520, 440, mist_x + 560, 1080), fill=(*mist, 138))
+    mist_layer = mist_layer.filter(ImageFilter.GaussianBlur(radius=165))
+    base = Image.alpha_composite(base, mist_layer)
+
+    # 2. Painterly layered horizontal wave washes (organic sweep, no obvious circles).
+    horizon_y = rng.randint(768, 808)
+    phase = rng.uniform(0.0, math.tau)
+    amp = rng.uniform(9.0, 18.0)
+    slope = rng.uniform(-0.02, 0.02)
+    wave_main = _build_wave(horizon_y, amp, 1.35, phase, slope)
+    wave_mid = _build_wave(horizon_y + 165, amp * 1.6, 1.15, phase + 1.1, -slope * 0.8)
+    wave_low = _build_wave(horizon_y + 340, amp * 1.4, 1.6, phase + 2.3, slope * 1.1)
+
+    art_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    art_draw = ImageDraw.Draw(art_layer)
+
+    # Primary rich pigment base below the horizon.
+    art_draw.polygon(wave_main + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*wash, 240))
+    # Sweeping mineral / sunlit secondary wash across lower region.
+    art_draw.polygon(wave_mid + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*bloom, 205))
+    # Warm sunlit fade near bottom edge.
+    light_paper = (
+        min(255, int(bloom[0] * 0.45 + PAPER_COLOR[0] * 0.55)),
+        min(255, int(bloom[1] * 0.45 + PAPER_COLOR[1] * 0.55)),
+        min(255, int(bloom[2] * 0.45 + PAPER_COLOR[2] * 0.55)),
+    )
+    art_draw.polygon(wave_low + [(CARD_WIDTH, CARD_HEIGHT), (0, CARD_HEIGHT)], fill=(*light_paper, 175))
+
+    # Deep organic pigment ridge right along the horizon transition.
+    ridge_band = [(x, y - 6) for x, y in wave_main] + [(x, y + 72) for x, y in reversed(wave_main)]
+    art_draw.polygon(ridge_band, fill=(*horizon_dark, 232))
+    art_layer = art_layer.filter(ImageFilter.GaussianBlur(radius=48))
+    base = Image.alpha_composite(base, art_layer)
+
+    # 3. Tactile horizon stipple edge: subtly textured pigment band along the wave crest.
+    jitter = [rng.uniform(-4.5, 4.5) for _ in range(len(wave_main))]
+    crest_wave = _build_wave(horizon_y + 4, amp, 1.35, phase, slope, offset_jitter=jitter)
+    crest_layer = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    crest_draw = ImageDraw.Draw(crest_layer)
+    crest_draw.line([(x, y - 16) for x, y in crest_wave], fill=(*mist, 130), width=22)
+    crest_draw.line(crest_wave, fill=(*horizon_dark, 175), width=20)
+    crest_layer = crest_layer.filter(ImageFilter.GaussianBlur(radius=11))
+    base = Image.alpha_composite(base, crest_layer)
+
+    return _apply_analog_grain(base, seed)
+
+
+def _draw_centered_lines(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    start_y: int,
+    line_step: int,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int, int],
+) -> int:
+    """Draw horizontally centered lines and return the ending y-coordinate."""
+    y = start_y
+    for line in lines:
+        w = _text_width(draw, line, font)
+        draw.text(((CARD_WIDTH - w) / 2, y), line, font=font, fill=fill)
+        y += line_step
+    return y
 
 
 def render_news_card(topic: dict, output_path: str | Path, handle: str = "@thechronobyte") -> Path:
-    """Render a 1080x1350 editorial JPEG card for the given news topic."""
+    """Render a 1080x1350 editorial JPEG card with paper top + textured horizon art."""
     source = _strip_invisible(topic.get("source", "Tech News"))
     headline_text = _strip_invisible(topic["text"])
-    accent = SOURCE_ACCENTS.get(source, DEFAULT_ACCENT)
-    canvas = _draw_background(accent)
-    # Draw translucent chrome on a separate RGBA layer so alpha blends cleanly.
-    chrome = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
-    chrome_draw = ImageDraw.Draw(chrome)
+    seed = _topic_seed(topic)
+    palettes = SOURCE_PALETTES.get(source, DEFAULT_PALETTES)
+    palette = palettes[seed % len(palettes)]
+    accent = palette[0]
 
-    margin = 76
-    content_width = CARD_WIDTH - margin * 2
+    canvas = _draw_editorial_background(palette, seed)
+    draw = ImageDraw.Draw(canvas)
 
-    font_brand = _load_font("semibold", 24)
-    font_sub = _load_font("regular", 19)
-    font_pill = _load_font("bold", 20)
-    font_headline = _load_font("bold", 62)
-    font_body = _load_font("regular", 34)
+    font_header_bold = _load_font("semibold", 19)
+    font_header = _load_font("regular", 19)
+    font_headline = _load_font("serif", 68)
+    font_body = _load_font("regular", 30)
 
-    # Top header bar.
-    dot_y = 78
-    chrome_draw.rounded_rectangle((margin, dot_y + 5, margin + 16, dot_y + 21), radius=4, fill=(*accent, 255))
-    chrome_draw.text((margin + 28, dot_y), "CHRONO BYTE", font=font_brand, fill=(248, 250, 252, 255))
-    chrome_draw.text(
-        (margin + 28, dot_y + 32),
-        f"DAILY AI & SILICON BRIEF  ·  {handle}",
-        font=font_sub,
-        fill=(148, 163, 184, 255),
-    )
+    # Subtle minimal top masthead so the headline & subhead remain the centerpiece.
+    margin_x = 76
+    top_y = 54
+    draw.rounded_rectangle((margin_x, top_y + 5, margin_x + 12, top_y + 17), radius=3, fill=(*accent, 255))
+    brand_label = "CHRONO BYTE"
+    draw.text((margin_x + 22, top_y), brand_label, font=font_header_bold, fill=(*INK_SECONDARY, 235))
+    brand_w = _text_width(draw, brand_label, font_header_bold)
+    draw.text((margin_x + 28 + brand_w, top_y), f" ·  {handle}", font=font_header, fill=(*INK_MUTED, 235))
 
     published = topic["published"]
     date_label = published.strftime("%b %d, %Y").upper().replace(" 0", " ")
-    _draw_pill(
-        chrome_draw,
-        (CARD_WIDTH - margin - int(_text_width(chrome_draw, date_label, font_pill)) - 44, dot_y + 4),
-        date_label,
-        font_pill,
-        fill=(255, 255, 255, 18),
-        outline=(255, 255, 255, 42),
-        text_fill=(203, 213, 225, 255),
-    )
+    meta_label = f"{source.upper()}  ·  {date_label}"
+    meta_w = _text_width(draw, meta_label, font_header)
+    draw.text((CARD_WIDTH - margin_x - meta_w, top_y), meta_label, font=font_header, fill=(*INK_MUTED, 235))
 
-    chrome_draw.line((margin, 162, CARD_WIDTH - margin, 162), fill=(255, 255, 255, 28), width=2)
-
-    # Source + Topic pills.
-    pill_y = 202
-    next_x = _draw_pill(
-        chrome_draw,
-        (margin, pill_y),
-        source.upper(),
-        font_pill,
-        fill=(*accent, 46),
-        outline=(*accent, 195),
-        text_fill=(248, 250, 252, 255),
-    )
-    topic_tag = _strip_invisible(topic.get("topic_tag") or "")
-    if topic_tag and topic_tag.lower() != source.lower():
-        _draw_pill(
-            chrome_draw,
-            (next_x + 16, pill_y),
-            topic_tag.upper(),
-            font_pill,
-            fill=(30, 41, 59, 200),
-            outline=(100, 116, 139, 130),
-            text_fill=(203, 213, 225, 255),
-        )
-
-    canvas = Image.alpha_composite(canvas, chrome)
-    draw = ImageDraw.Draw(canvas)
-
-    # Main headline.
-    headline_lines = _wrap_text(draw, headline_text, font_headline, content_width, max_lines=4)
+    # Measure centered editorial headline + subhead inside the upper paper region.
+    headline_width = 820
+    headline_lines = _wrap_text(draw, headline_text, font_headline, headline_width, max_lines=4)
     if len(headline_lines) >= 4:
-        font_headline = _load_font("bold", 54)
-        headline_lines = _wrap_text(draw, headline_text, font_headline, content_width, max_lines=4)
+        font_headline = _load_font("serif", 58)
+        headline_lines = _wrap_text(draw, headline_text, font_headline, headline_width, max_lines=4)
+    headline_step = int(font_headline.size * 1.13)
 
-    y = 288
-    line_step = int(font_headline.size * 1.2)
-    for line in headline_lines:
-        draw.text((margin, y), line, font=font_headline, fill=(248, 250, 252, 255))
-        y += line_step
+    subhead_text = _build_subhead(topic)
+    body_width = 760
+    body_step = 42
+    body_lines = _wrap_text(draw, subhead_text, font_body, body_width, max_lines=4) if subhead_text else []
 
-    # Accent divider bar.
-    y += 20
-    draw.rounded_rectangle((margin, y, margin + 96, y + 6), radius=3, fill=(*accent, 255))
-    y += 40
+    gap = 32 if body_lines else 0
+    block_height = len(headline_lines) * headline_step + gap + len(body_lines) * body_step
+    zone_top = 148
+    zone_bottom = 720
+    start_y = max(zone_top, zone_top + (zone_bottom - zone_top - block_height) // 2)
 
-    # Body paragraphs (generous clean bottom margin; source/links go in caption).
-    max_body_y = CARD_HEIGHT - 96
-    body_step = 48
-    paragraphs = _build_body_paragraphs(topic)
-    for para in paragraphs:
-        remaining_lines = max(0, (max_body_y - y) // body_step)
-        if remaining_lines < 2:
-            break
-        wrapped = _wrap_text(draw, para, font_body, content_width, max_lines=remaining_lines)
-        for line in wrapped:
-            draw.text((margin, y), line, font=font_body, fill=(203, 213, 225, 255))
-            y += body_step
-        y += 24
+    after_headline_y = _draw_centered_lines(
+        draw,
+        headline_lines,
+        start_y,
+        headline_step,
+        font_headline,
+        (*INK_PRIMARY, 255),
+    )
+    if body_lines:
+        _draw_centered_lines(
+            draw,
+            body_lines,
+            after_headline_y + gap,
+            body_step,
+            font_body,
+            (*INK_SECONDARY, 245),
+        )
 
     dest = Path(output_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
