@@ -31,11 +31,16 @@ newest eligible publication. The default freshness window is **72 hours** (set
 `MAX_NEWS_AGE_HOURS` between `1` and `168`). If nothing qualifies, the run skips
 successfully.
 
-Posts stay within Threads' **500-character** limit (checked conservatively
-against UTF-8 byte length) and use Threads' native features:
-- **Readable post text (no raw URL clutter):** Includes `Source | YYYY-MM-DD`,
-  the headline, and the article summary extracted from the RSS `<description>` /
-  `<content:encoded>` (or optionally refined via Groq).
+Posts stay within Threads' **500-character** limit per post (checked
+conservatively against UTF-8 byte length) and use Threads' native features:
+- **Unique story daily:** Checks recent posts on your Threads profile
+  (`GET /{user_id}/threads`) and skips already-posted headlines so quiet days
+  pick the next-newest story instead of repeating.
+- **Deep article context + 2-part thread chains:** Extracts the RSS summary plus
+  leading paragraphs from the verified official article URL. When extra detail is
+  available, it publishes a crisp main post followed by a self-reply (`reply_to_id`)
+  ending with a topic-tailored discussion question (or optionally crafts the
+  thread via Groq).
 - **Rich link preview card:** Attaches the official article URL via Threads'
   `link_attachment` parameter rather than pasting a raw URL into the text.
 - **Threads Topic tag (`topic_tag`):** Automatically attaches a relevant topic

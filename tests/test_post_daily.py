@@ -21,8 +21,19 @@ class DailyThreadsPostTests(unittest.TestCase):
         )
         self.topic = {
             "source": "NVIDIA",
+            "allowed_host": "blogs.nvidia.com",
             "text": "NVIDIA announces a new GPU for machine learning.",
             "summary": "The new architecture improves inference throughput and energy efficiency for data centers.",
+            "paragraphs": [
+                (
+                    "Early benchmarks show up to 2.4x faster token generation across large multimodal "
+                    "workloads while reducing rack power draw across hyperscale deployments and enterprise clusters."
+                ),
+                (
+                    "Cloud providers and enterprise AI teams will begin deploying the new systems globally "
+                    "early next quarter alongside updated CUDA libraries, compiler optimizations, and reference designs."
+                ),
+            ],
             "source_url": "https://blogs.nvidia.com/blog/new-gpu/",
             "published": datetime(2026, 11, 13, 12, tzinfo=timezone.utc),
             "topic_tag": "AI Hardware",
@@ -30,9 +41,12 @@ class DailyThreadsPostTests(unittest.TestCase):
         self.now = datetime(2026, 11, 14, 12, tzinfo=timezone.utc)
 
     @staticmethod
-    def response(payload, status=200):
+    def response(payload, status=200, url="", headers=None):
         response = requests.Response()
         response.status_code = status
+        response.url = url
+        if headers:
+            response.headers.update(headers)
         response._content = (
             payload.encode("utf-8") if isinstance(payload, str) else json.dumps(payload).encode("utf-8")
         )
@@ -67,7 +81,15 @@ class DailyThreadsPostTests(unittest.TestCase):
         ).encode()
         return response
 
-    def test_newest_relevant_story_wins_and_extracts_html_summary_and_topic(self):
+    def test_newest_relevant_story_wins_and_fetches_article_paragraphs(self):
+        article_html = (
+            "<nav><p>Navigation links that should be skipped even when long enough.</p></nav>"
+            "<article>"
+            "<p>We use cookies — Accept cookies to continue reading this site.</p>"
+            "<p>Google is rolling out faster reasoning and deeper multimodal search across 120 countries starting today.</p>"
+            "<p>Developers can also test the new capabilities directly in Search Labs and the Gemini API.</p>"
+            "</article>"
+        )
         feeds = [
             self.feed([]),
             self.feed([{}]),
@@ -79,20 +101,68 @@ class DailyThreadsPostTests(unittest.TestCase):
             }]),
             self.feed([]),
             self.feed([]),
+            self.response(article_html, url="https://blog.google/new-gemini/", headers={"Content-Type": "text/html"}),
         ]
-        with patch.object(bot.requests, "get", side_effect=feeds) as get:
+        with patch.object(bot.requests, "get", side_effect=feeds):
             topic = bot.get_topic_of_the_day(self.now)
         self.assertEqual(topic["source"], "Google AI")
-        self.assertEqual(topic["text"], "Google announces a new Gemini model")
-        self.assertEqual(topic["summary"], "Faster reasoning & multimodal context.")
         self.assertEqual(topic["topic_tag"], "Google Gemini")
-        self.assertEqual(get.call_count, len(bot.NEWS_FEEDS))
-        self.assertIn("timeout", get.call_args.kwargs)
-        self.assertIn("User-Agent", get.call_args.kwargs["headers"])
+        self.assertEqual(len(topic["paragraphs"]), 2)
+        self.assertIn("120 countries", topic["paragraphs"][0])
+
+    def test_article_fetch_ignores_off_host_redirects_and_failures(self):
+        redirected = self.response(
+            "<p>Off-domain paragraph that must not be read from external host.</p>",
+            url="https://evil.example/phish",
+            headers={"Content-Type": "text/html"},
+        )
+        with patch.object(bot.requests, "get", return_value=redirected):
+            self.assertEqual(bot._fetch_article_paragraphs("https://blog.google/x", "blog.google", "test"), [])
+        with patch.object(bot.requests, "get", side_effect=requests.Timeout):
+            self.assertEqual(bot._fetch_article_paragraphs("https://blog.google/x", "blog.google", "test"), [])
+
+    def test_deduplication_skips_already_posted_story_for_fresh_story(self):
+        self.credentials()
+        recent_threads = self.response({
+            "data": [{"id": "1", "text": "⚡ OpenAI just shared: Old posted AI story"}]
+        })
+        feed_with_two = self.feed([
+            {
+                "title": "Old posted AI story",
+                "link": "https://openai.com/news/old-story",
+                "date": format_datetime(self.now - timedelta(hours=1)),
+            },
+            {
+                "title": "Fresh unposted AI story",
+                "link": "https://openai.com/news/fresh-story",
+                "date": format_datetime(self.now - timedelta(hours=3)),
+            },
+        ])
+        article_resp = self.response("<p>Fresh article paragraph with concrete technical details for readers.</p>")
+        side_effects = [
+            feed_with_two,
+            self.feed([]),
+            self.feed([]),
+            self.feed([]),
+            self.feed([]),
+            recent_threads,
+            article_resp,
+        ]
+        with patch.object(bot.requests, "get", side_effect=side_effects):
+            topic = bot.get_topic_of_the_day(self.now)
+        self.assertEqual(topic["text"], "Fresh unposted AI story")
 
     def test_content_encoded_fallback_and_script_stripping(self):
         html_content = "<script>alert(1)</script><p>First paragraph.</p><p>Second paragraph.</p>"
-        with patch.object(bot.requests, "get", return_value=self.feed([{"content": html_content}])):
+        side_effects = [
+            self.feed([]),
+            self.feed([{"content": html_content}]),
+            self.feed([]),
+            self.feed([]),
+            self.feed([]),
+            self.response(""),
+        ]
+        with patch.object(bot.requests, "get", side_effect=side_effects):
             topic = bot.get_topic_of_the_day(self.now)
         self.assertEqual(topic["summary"], "First paragraph. Second paragraph.")
 
@@ -137,7 +207,14 @@ class DailyThreadsPostTests(unittest.TestCase):
                 bot.get_topic_of_the_day(self.now)
 
     def test_one_failed_feed_does_not_block_other_sources(self):
-        feeds = [requests.Timeout(), self.feed([{}]), self.feed([]), self.feed([]), self.feed([])]
+        feeds = [
+            requests.Timeout(),
+            self.feed([{}]),
+            self.feed([]),
+            self.feed([]),
+            self.feed([]),
+            self.response(""),
+        ]
         with patch.object(bot.requests, "get", side_effect=feeds):
             self.assertEqual(bot.get_topic_of_the_day(self.now)["source"], "NVIDIA")
 
@@ -150,40 +227,44 @@ class DailyThreadsPostTests(unittest.TestCase):
 
     def test_rss_title_preserves_source_wording_and_unescapes_entities(self):
         title = "AI &amp; GPUs: A new model"
-        with patch.object(bot.requests, "get", return_value=self.feed([{"title": title}])):
+        side_effects = [
+            self.feed([]),
+            self.feed([{"title": title}]),
+            self.feed([]),
+            self.feed([]),
+            self.feed([]),
+            self.response(""),
+        ]
+        with patch.object(bot.requests, "get", side_effect=side_effects):
             topic = bot.get_topic_of_the_day(self.now)
         self.assertEqual(topic["text"], "AI & GPUs: A new model")
 
-    def test_no_groq_key_builds_readable_post_without_raw_url(self):
-        post_text = bot.generate_post(self.topic)
-        self.assertEqual(
-            post_text,
-            "NVIDIA | 2026-11-13\n\n"
-            "NVIDIA announces a new GPU for machine learning.\n\n"
-            "The new architecture improves inference throughput and energy efficiency for data centers.",
-        )
-        self.assertNotIn("https://", post_text)
+    def test_generate_thread_creates_rich_two_part_thread_without_raw_urls(self):
+        posts = bot.generate_thread(self.topic)
+        self.assertEqual(len(posts), 2)
+        for post in posts:
+            self.assertLessEqual(len(post), 500)
+            self.assertLessEqual(bot._post_weight(post), 500)
+            self.assertNotIn("https://", post)
+        self.assertIn("NVIDIA", posts[0])
+        self.assertIn("2.4x faster token generation", posts[0])
+        self.assertIn("early next quarter", posts[0])
+        self.assertIn("data centers", posts[1])
+        self.assertIn("?", posts[1])
 
-    def test_summary_that_starts_with_title_is_not_duplicated(self):
-        topic = {
-            **self.topic,
-            "source": "OpenAI",
-            "text": "Introducing ChatGPT Wallet",
-            "summary": "Introducing ChatGPT Wallet, a secure way for agents to complete purchases.",
-        }
-        post_text = bot.generate_post(topic)
-        self.assertEqual(
-            post_text,
-            "OpenAI | 2026-11-13\n\n"
-            "Introducing ChatGPT Wallet, a secure way for agents to complete purchases.",
-        )
+    def test_generate_thread_single_post_includes_question_when_short(self):
+        short_topic = {**self.topic, "paragraphs": []}
+        posts = bot.generate_thread(short_topic)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("?", posts[0])
+        self.assertLessEqual(bot._post_weight(posts[0]), 500)
 
     def test_long_summaries_and_unicode_fit_within_500_limit(self):
         for summary in ("New machine learning research. " * 100, "界😀" * 300, "x" * 700):
             with self.subTest(summary=summary[:25]):
-                post_text = bot.generate_post({**self.topic, "summary": summary})
-                self.assertLessEqual(len(post_text), 500)
-                self.assertLessEqual(bot._post_weight(post_text), 500)
+                for post in bot.generate_thread({**self.topic, "summary": summary, "paragraphs": []}):
+                    self.assertLessEqual(len(post), 500)
+                    self.assertLessEqual(bot._post_weight(post), 500)
 
     def test_topic_tag_selection_respects_threads_rules(self):
         cases = (
@@ -200,25 +281,30 @@ class DailyThreadsPostTests(unittest.TestCase):
             self.assertNotIn("&", tag)
             self.assertLessEqual(len(tag), 50)
 
-    def test_valid_groq_rewrite_uses_requested_model(self):
+    def test_valid_groq_two_part_thread_uses_requested_model(self):
         os.environ["GROQ_API_KEY"] = "test-groq-key"
         payload = {
             "choices": [{
                 "finish_reason": "stop",
-                "message": {"content": "NVIDIA unveiled a new ML GPU focused on faster inference and efficiency."},
+                "message": {
+                    "content": (
+                        "NVIDIA just raised the bar for data-center inference.\n\n"
+                        "---THREAD_BREAK---\n\n"
+                        "Systems roll out next quarter with 2.4x speedups. Ready to upgrade?"
+                    )
+                },
             }]
         }
         with patch.object(bot.requests, "post", return_value=self.response(payload)) as post:
-            post_text = bot.generate_post(self.topic)
-        self.assertIn("NVIDIA unveiled a new ML GPU", post_text)
-        self.assertTrue(post_text.startswith("NVIDIA | 2026-11-13\n\n"))
-        self.assertNotIn("https://", post_text)
+            posts = bot.generate_thread(self.topic)
+        self.assertEqual(len(posts), 2)
+        self.assertIn("raised the bar", posts[0])
+        self.assertIn("Ready to upgrade?", posts[1])
         self.assertEqual(post.call_args.kwargs["json"]["model"], "llama-3.1-8b-instant")
-        self.assertIn("timeout", post.call_args.kwargs)
         post.assert_called_once()
 
     def test_bad_groq_responses_fall_back(self):
-        fallback = bot.generate_post(self.topic)
+        fallback = bot.generate_thread(self.topic)
         os.environ["GROQ_API_KEY"] = "test-groq-key"
         payloads = [None, {}, {"choices": []}]
         for content, reason in (
@@ -235,10 +321,10 @@ class DailyThreadsPostTests(unittest.TestCase):
         for payload in payloads:
             with self.subTest(payload=payload):
                 with patch.object(bot.requests, "post", return_value=self.response(payload)):
-                    self.assertEqual(bot.generate_post(self.topic), fallback)
+                    self.assertEqual(bot.generate_thread(self.topic), fallback)
 
     def test_groq_errors_fall_back_without_leaking_key(self):
-        fallback = bot.generate_post(self.topic)
+        fallback = bot.generate_thread(self.topic)
         os.environ["GROQ_API_KEY"] = "test-groq-key"
         errors = (
             requests.Timeout("test-groq-key"),
@@ -249,7 +335,7 @@ class DailyThreadsPostTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 with patch.object(bot.requests, "post", side_effect=error):
                     with self.assertLogs(bot.LOGGER, level="WARNING") as logs:
-                        self.assertEqual(bot.generate_post(self.topic), fallback)
+                        self.assertEqual(bot.generate_thread(self.topic), fallback)
                 self.assertNotIn("test-groq-key", " ".join(logs.output))
 
     def test_post_requires_credentials_and_valid_user_id_and_reply_control(self):
@@ -270,50 +356,53 @@ class DailyThreadsPostTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     bot.post_to_threads(post_text, self.topic["source_url"])
 
-    def test_threads_two_step_container_with_topic_reply_control_and_link_card(self):
+    def test_publish_thread_creates_two_part_chain_with_reply_to_id(self):
         self.credentials()
-        responses = [
-            self.response({"id": "container-111"}),
-            self.response({"id": "post-999"}),
+        post_responses = [
+            self.response({"id": "container-1"}),
+            self.response({"id": "post-1"}),
+            self.response({"id": "container-2"}),
+            self.response({"id": "post-2"}),
         ]
         status_responses = [
-            self.response({"id": "container-111", "status": "IN_PROGRESS"}),
-            self.response({"id": "container-111", "status": "FINISHED"}),
+            self.response({"id": "container-1", "status": "IN_PROGRESS"}),
+            self.response({"id": "container-1", "status": "FINISHED"}),
+            self.response({"id": "container-2", "status": "FINISHED"}),
         ]
         with (
-            patch.object(bot.requests, "post", side_effect=responses) as post,
-            patch.object(bot.requests, "get", side_effect=status_responses) as get,
+            patch.object(bot.requests, "post", side_effect=post_responses) as post,
+            patch.object(bot.requests, "get", side_effect=status_responses),
             patch.object(bot.time, "sleep") as sleep,
         ):
-            post_id = bot.post_to_threads(
-                "NVIDIA news",
-                self.topic["source_url"],
-                topic_tag="AI. & Hardware",
-                reply_control="followers_only",
-            )
-        self.assertEqual(post_id, "post-999")
-        self.assertEqual(post.call_count, 2)
-        self.assertEqual(get.call_count, 2)
+            ids = bot.publish_thread(["Part 1", "Part 2"], self.topic["source_url"], topic_tag="AI. & Hardware")
+        self.assertEqual(ids, ["post-1", "post-2"])
         sleep.assert_called_once_with(2.0)
 
-        first_call, second_call = post.call_args_list
-        self.assertEqual(first_call.args[0], "https://graph.threads.net/v1.0/1234567890/threads")
-        self.assertEqual(first_call.kwargs["data"], {
-            "media_type": "TEXT",
-            "text": "NVIDIA news",
-            "link_attachment": self.topic["source_url"],
-            "reply_control": "followers_only",
-            "topic_tag": "AI  Hardware",
-            "access_token": "test-threads-token",
-        })
-        self.assertEqual(first_call.kwargs["timeout"], (5, 20))
+        root_create = post.call_args_list[0].kwargs["data"]
+        self.assertEqual(root_create["topic_tag"], "AI  Hardware")
+        self.assertEqual(root_create["link_attachment"], self.topic["source_url"])
+        self.assertNotIn("reply_to_id", root_create)
 
-        self.assertEqual(second_call.args[0], "https://graph.threads.net/v1.0/1234567890/threads_publish")
-        self.assertEqual(second_call.kwargs["data"], {
-            "creation_id": "container-111",
-            "access_token": "test-threads-token",
-        })
-        self.assertEqual(second_call.kwargs["timeout"], (5, 20))
+        reply_create = post.call_args_list[2].kwargs["data"]
+        self.assertEqual(reply_create["reply_to_id"], "post-1")
+        self.assertNotIn("topic_tag", reply_create)
+        self.assertNotIn("link_attachment", reply_create)
+
+    def test_publish_thread_warns_if_followup_reply_fails_after_root(self):
+        self.credentials()
+        post_responses = [
+            self.response({"id": "container-1"}),
+            self.response({"id": "post-1"}),
+            requests.Timeout("reply failed"),
+        ]
+        with (
+            patch.object(bot.requests, "post", side_effect=post_responses),
+            patch.object(bot.requests, "get", return_value=self.response({"status": "FINISHED"})),
+            self.assertLogs(bot.LOGGER, level="WARNING") as logs,
+        ):
+            ids = bot.publish_thread(["Part 1", "Part 2"], self.topic["source_url"], topic_tag="OpenAI")
+        self.assertEqual(ids, ["post-1"])
+        self.assertIn("already published", " ".join(logs.output))
 
     def test_container_error_prevents_publish(self):
         self.credentials()
@@ -368,7 +457,7 @@ class DailyThreadsPostTests(unittest.TestCase):
 
     def test_main_previews_by_default_without_credentials(self):
         with patch.object(bot, "get_topic_of_the_day", return_value=self.topic):
-            with patch.object(bot, "post_to_threads") as post:
+            with patch.object(bot, "publish_thread") as post:
                 with self.assertLogs(bot.LOGGER, level="INFO") as logs:
                     self.assertEqual(bot.main([]), 0)
         post.assert_not_called()
@@ -379,7 +468,7 @@ class DailyThreadsPostTests(unittest.TestCase):
     def test_main_only_posts_with_explicit_false_and_passes_topic_tag(self):
         os.environ["DRY_RUN"] = "false"
         with patch.object(bot, "get_topic_of_the_day", return_value=self.topic):
-            with patch.object(bot, "post_to_threads", return_value="999") as post:
+            with patch.object(bot, "publish_thread", return_value=["999"]) as post:
                 self.assertEqual(bot.main([]), 0)
         post.assert_called_once()
         self.assertEqual(post.call_args.kwargs["topic_tag"], "AI Hardware")
@@ -392,7 +481,7 @@ class DailyThreadsPostTests(unittest.TestCase):
 
     def test_main_skips_empty_feed_without_generation_or_post(self):
         with patch.object(bot, "get_topic_of_the_day", return_value=None):
-            with patch.object(bot, "generate_post") as generate, patch.object(bot, "post_to_threads") as post:
+            with patch.object(bot, "generate_thread") as generate, patch.object(bot, "publish_thread") as post:
                 self.assertEqual(bot.main([]), 0)
         generate.assert_not_called()
         post.assert_not_called()
