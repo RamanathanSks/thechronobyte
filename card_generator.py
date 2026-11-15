@@ -555,7 +555,7 @@ def _render_dark_duotone(
 
     margin_x = 84
     content_w = CARD_WIDTH - margin_x * 2
-    topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "AI BRIEF").upper()
+    topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "TECH BRIEF").upper()
     tag_font = _load_font("semibold", 19)
     draw.text((margin_x, 146), topic_tag, font=tag_font, fill=(*accent, 255))
 
@@ -659,7 +659,7 @@ def _render_riso_poster(
 
     draw.line((margin_x, 104, CARD_WIDTH - margin_x, 104), fill=(*INK_PRIMARY, 185), width=3)
     stamp_font = _load_font("semibold", 18)
-    topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "AI BRIEF").upper()
+    topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "TECH BRIEF").upper()
     draw.text((margin_x, 130), f"FOCUS  /  {topic_tag}", font=stamp_font, fill=(*INK_MUTED, 245))
 
     headline = _strip_invisible(topic["text"])

@@ -1,4 +1,4 @@
-name: Daily AI and hardware news (Threads & Instagram)
+name: Daily tech gaming and space news (Threads & Instagram)
 
 on:
   schedule:
@@ -54,6 +54,7 @@ jobs:
           PYTHONUTF8: '1'
           PYTHONUNBUFFERED: '1'
           MAX_NEWS_AGE_HOURS: '72'
+          STRICT_SOURCE_MODE: 'true' # Use original publisher wording; no LLM rewrites.
           # Both schedules and manual runs preview unless at least one platform is enabled and dry_run is false.
           DRY_RUN: ${{ (vars.ENABLE_THREADS_POSTING != 'true' && vars.ENABLE_INSTAGRAM_POSTING != 'true') || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
           ENABLE_THREADS: ${{ vars.ENABLE_THREADS_POSTING == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}

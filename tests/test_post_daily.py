@@ -18,6 +18,12 @@ import post_daily as bot
 class DailyThreadsPostTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.dict(os.environ, {}, clear=True))
+        # These tests focus on the existing publishing pipeline. New source
+        # boundary/verification behavior is tested directly in test_news_sources.
+        self.enterContext(patch.object(bot, "NEWS_FEEDS", bot.NEWS_FEEDS[:5]))
+        self.enterContext(patch.object(bot, "SOURCE_FETCH_WORKERS", 1))
+        self.enterContext(patch.object(bot, "fetch_source", side_effect=self.mock_feed_fetch))
+        self.enterContext(patch.object(bot, "verify_article", side_effect=self.mock_verify_article))
         self.enterContext(
             patch("requests.sessions.Session.request", side_effect=AssertionError("Unexpected network call"))
         )
@@ -41,6 +47,19 @@ class DailyThreadsPostTests(unittest.TestCase):
             "topic_tag": "AI Hardware",
         }
         self.now = datetime(2026, 11, 14, 12, tzinfo=timezone.utc)
+
+    def mock_feed_fetch(self, url, host, contact):
+        response = bot.requests.get(url)
+        response.raise_for_status()
+        return response.content, url, "application/rss+xml"
+
+    def mock_verify_article(self, topic, contact, now, hours):
+        return {
+            "paragraphs": bot._fetch_article_paragraphs(topic["source_url"], topic["allowed_host"], contact),
+            "summary": "", "content_blocks": [],
+            "verification": {"checked_at": now.isoformat(), "sha256": "fixture",
+                             "publication_date_basis": "test fixture"},
+        }
 
     @staticmethod
     def response(payload, status=200, url="", headers=None):
@@ -104,6 +123,8 @@ class DailyThreadsPostTests(unittest.TestCase):
             self.feed([]),
             self.feed([]),
             self.response(article_html, url="https://blog.google/new-gemini/", headers={"Content-Type": "text/html"}),
+            self.response("<p>The older NVIDIA article has additional information about its new GPU.</p>",
+                          url=self.topic["source_url"], headers={"Content-Type": "text/html"}),
         ]
         with patch.object(bot.requests, "get", side_effect=feeds):
             topic = bot.get_topic_of_the_day(self.now)
@@ -166,7 +187,7 @@ class DailyThreadsPostTests(unittest.TestCase):
         ]
         with patch.object(bot.requests, "get", side_effect=side_effects):
             topic = bot.get_topic_of_the_day(self.now)
-        self.assertEqual(topic["summary"], "First paragraph. Second paragraph.")
+        self.assertEqual(topic["summary"], "")  # No RSS-only fallback after verification.
 
     def test_default_date_is_utc(self):
         with patch.object(bot, "datetime") as clock:
@@ -272,7 +293,7 @@ class DailyThreadsPostTests(unittest.TestCase):
         cases = (
             ({"source": "OpenAI", "text": "ChatGPT update"}, "OpenAI"),
             ({"source": "Google AI", "text": "Gemini 4 release"}, "Google Gemini"),
-            ({"source": "AMD", "text": "New EPYC processor"}, "AI Hardware"),
+            ({"source": "AMD", "text": "New EPYC processor"}, "Computer Hardware"),
             ({"source": "Microsoft Research", "text": "New neural architecture"}, "Machine Learning"),
             ({"source": "Microsoft Research", "text": "AI policy update"}, "Artificial Intelligence"),
         )
@@ -284,6 +305,7 @@ class DailyThreadsPostTests(unittest.TestCase):
             self.assertLessEqual(len(tag), 50)
 
     def test_valid_groq_two_part_thread_uses_requested_model(self):
+        os.environ["STRICT_SOURCE_MODE"] = "false"  # Legacy experimental rewriting.
         os.environ["GROQ_API_KEY"] = "test-groq-key"
         payload = {
             "choices": [{
@@ -306,6 +328,7 @@ class DailyThreadsPostTests(unittest.TestCase):
         post.assert_called_once()
 
     def test_bad_groq_responses_fall_back(self):
+        os.environ["STRICT_SOURCE_MODE"] = "false"
         fallback = bot.generate_thread(self.topic)
         os.environ["GROQ_API_KEY"] = "test-groq-key"
         payloads = [None, {}, {"choices": []}]
@@ -326,6 +349,7 @@ class DailyThreadsPostTests(unittest.TestCase):
                     self.assertEqual(bot.generate_thread(self.topic), fallback)
 
     def test_groq_errors_fall_back_without_leaking_key(self):
+        os.environ["STRICT_SOURCE_MODE"] = "false"
         fallback = bot.generate_thread(self.topic)
         os.environ["GROQ_API_KEY"] = "test-groq-key"
         errors = (
@@ -514,6 +538,7 @@ class DailyThreadsPostTests(unittest.TestCase):
         self.assertLessEqual(len(caption), bot.MAX_IG_CAPTION_LENGTH)
 
     def test_instagram_caption_groq_validation_and_fallback(self):
+        os.environ["STRICT_SOURCE_MODE"] = "false"
         os.environ["GROQ_API_KEY"] = "test-groq-key"
         valid_groq = self.response({
             "choices": [{

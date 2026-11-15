@@ -1,4 +1,4 @@
-"""Preview fresh AI/CPU/GPU/ML news from primary sources; optionally post to Threads & Instagram."""
+"""Verify original tech, gaming and space news; preview or post to Threads/Instagram."""
 
 import base64
 import hashlib
@@ -11,6 +11,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
@@ -18,31 +19,38 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
+from news_sources import (
+    NEWS_FEEDS, SOURCE_CATEGORIES, PRICE_PATTERN, RUMOR_PATTERN,
+    NEWSROOM_PATHS, REQUIRES_TECH_MATCH,
+    fetch_source, feed_items, parse_date, verify_article, load_newsroom, approved_url,
+)
 
 LOGGER = logging.getLogger(__name__)
-NEWS_FEEDS = (
-    ("OpenAI", "https://openai.com/news/rss.xml", "openai.com"),
-    ("NVIDIA", "https://blogs.nvidia.com/feed/", "blogs.nvidia.com"),
-    ("Google AI", "https://blog.google/technology/ai/rss/", "blog.google"),
-    ("AMD", "https://ir.amd.com/news-events/press-releases/rss", "ir.amd.com"),
-    ("Microsoft Research", "https://www.microsoft.com/en-us/research/feed/", "www.microsoft.com"),
-)
+SOURCE_FETCH_WORKERS = 6  # Bounded parallel reads keep the daily job short.
 SOURCE_EMOJIS = {
     "OpenAI": "⚡",
     "NVIDIA": "⚙️",
     "Google AI": "🧠",
     "AMD": "🚀",
     "Microsoft Research": "🔬",
+    "Apple": "📱", "Meta": "🌐", "Microsoft": "💻", "Xbox": "🎮",
+    "PlayStation": "🎮", "Samsung": "📱", "Google Devices": "📱", "NASA": "🚀",
 }
 CONTENT_ENCODED_TAG = "{http://purl.org/rss/1.0/modules/content/}encoded"
 TOPIC_PATTERN = re.compile(
     r"\b(ai|artificial intelligence|machine learning|ml|cpus?|gpus?|processors?|"
     r"semiconductors?|chips?|llms?|generative|neural|chatgpt|gpt-\d\w*|gemini|"
-    r"deepmind|cuda|blackwell|rubin|geforce|radeon|ryzen|epyc|xeon)\b", re.I,
+    r"deepmind|cuda|blackwell|rubin|geforce|radeon|ryzen|epyc|xeon|"
+    r"ram|memory|ddr[3456]|gddr\d|gaming|games?|xbox|playstation|nintendo|"
+    r"smartphones?|iphone|android|galaxy|pixel|apple|meta|microsoft|"
+    r"spacecraft|satellites?|rockets?|missions?|robotics|quantum|technology|"
+    r"cloud|cybersecurity|security|software|data centers?|broadband|wi-fi|wifi|"
+    r"internet|streaming|devices?|alexa|aws|kindle|payments|fintech|developers?|"
+    r"claude|anthropic|figma|notion|copilot|agents?|productivity|automation|apis?)\b", re.I,
 )
 FINANCIAL_PATTERN = re.compile(r"\b(earnings|financial results|dividends?|stockholders?|shareholders?)\b", re.I)
 HARDWARE_TOPIC_PATTERN = re.compile(
-    r"\b(cpus?|gpus?|processors?|semiconductors?|chips?|cuda|blackwell|rubin|geforce|radeon|ryzen|epyc|xeon)\b",
+    r"\b(cpus?|gpus?|processors?|semiconductors?|chips?|ram|memory|ddr[3456]|gddr\d|cuda|blackwell|rubin|geforce|radeon|ryzen|epyc|xeon)\b",
     re.I,
 )
 ML_TOPIC_PATTERN = re.compile(r"\b(machine learning|neural|llms?)\b", re.I)
@@ -102,11 +110,9 @@ DISCUSSION_PROMPTS = {
     ),
 }
 HOOK_TEMPLATES = (
-    "{emoji} {source} just shared: {title}",
-    "{emoji} Fresh from {source} ({date_label}): {title}",
-    "{emoji} Today in {topic_tag} — {title}",
-    "{emoji} {source} update: {title}",
-    "{emoji} Worth watching ({source}): {title}",
+    "{emoji} According to {source} ({date_label}): {title}",
+    "{emoji} From {source} ({date_label}): {title}",
+    "{emoji} {source} reports ({date_label}): {title}",
 )
 FOLLOWUP_INTROS = (
     "More from the announcement ↓",
@@ -114,10 +120,8 @@ FOLLOWUP_INTROS = (
     "Closer look at the details ↓",
 )
 IG_HOOK_TEMPLATES = (
-    "{emoji} {source} update ({date_label}) — here's what actually changed ↓",
-    "{emoji} Why {source}'s new {topic_tag} release matters today ({date_label}) ↓",
-    "{emoji} Fresh from {source} ({date_label}): the key takeaways ↓",
-    "{emoji} Breaking down {source}'s latest {topic_tag} move ({date_label}) ↓",
+    "{emoji} According to {source} ({date_label}) ↓",
+    "{emoji} From the original {source} announcement ({date_label}) ↓",
 )
 IG_THREAD_CTAS = (
     "🔗 Clickable source link & full discussion on @thechronobyte Threads (link in bio).",
@@ -138,7 +142,29 @@ IG_TOPIC_HASHTAGS = {
     "Machine Learning": ("#MachineLearning", "#DeepLearning"),
     "Artificial Intelligence": ("#ArtificialIntelligence", "#TechInnovation"),
 }
-IG_BASE_HASHTAGS = ("#ArtificialIntelligence", "#AI", "#TechNews", "#TheChronoByte")
+IG_BASE_HASHTAGS = ("#TechNews", "#TheChronoByte")
+IG_TOPIC_HASHTAGS.update({
+    "Video Games": ("#Gaming", "#VideoGames"),
+    "Mobile Phones": ("#Smartphones", "#MobileTech"),
+    "Component Prices": ("#HardwarePrices", "#PCComponents"),
+    "Computer Hardware": ("#Hardware", "#PCComponents"),
+    "Tech Industry": ("#Technology", "#TechIndustry"),
+    "Space Programs": ("#Space", "#SpaceTechnology"),
+    "New Technology": ("#Technology", "#Innovation"),
+    "Claude": ("#Claude", "#Anthropic", "#AI"),
+    "Design Tools": ("#DesignTools", "#ProductDesign"),
+    "Productivity": ("#Productivity", "#Software"),
+    "Cloud Computing": ("#CloudComputing", "#Cloud"),
+    "Developer Tools": ("#DeveloperTools", "#Software"),
+    "Cybersecurity": ("#Cybersecurity", "#Security"),
+    "Financial Technology": ("#FinTech", "#Technology"),
+    "Connectivity": ("#Networking", "#Connectivity"),
+})
+for _tag in ("Video Games", "Mobile Phones", "Component Prices", "Computer Hardware",
+             "Tech Industry", "Space Programs", "New Technology", "Claude", "Design Tools",
+             "Productivity", "Cloud Computing", "Developer Tools", "Cybersecurity",
+             "Financial Technology", "Connectivity"):
+    DISCUSSION_PROMPTS[_tag] = ("Which detail in this announcement matters most to you?",)
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -258,16 +284,28 @@ def _shorten(text: str, limit: int) -> str:
 def _pick_topic_tag(topic: dict) -> str:
     """Select a Threads topic_tag (1-50 chars, no '.' or '&')."""
     combined = f"{topic['text']} {topic.get('summary', '')}"
-    if re.search(r"\b(gemini|deepmind)\b", combined, re.I):
+    if PRICE_PATTERN.search(topic["text"]) and HARDWARE_TOPIC_PATTERN.search(combined):
+        tag = "Component Prices"
+    elif topic["source"] in {"NASA"} or re.search(r"\b(spacecraft|rocket|satellite|artemis)\b", combined, re.I):
+        tag = "Space Programs"
+    elif re.search(r"\b(smartphones?|iphone|galaxy|pixel\s+\d|mobile phones?)\b", combined, re.I):
+        tag = "Mobile Phones"
+    elif topic["source"] in {"Xbox", "PlayStation"} or re.search(r"\b(video games?|gaming|gameplay)\b", combined, re.I):
+        tag = "Video Games"
+    elif topic["source"] == "Anthropic" or re.search(r"\bclaude\b", combined, re.I):
+        tag = "Claude"
+    elif re.search(r"\b(gemini|deepmind)\b", combined, re.I):
         tag = "Google Gemini"
     elif re.search(r"\b(openai|chatgpt|gpt-\d\w*)\b", combined, re.I) or topic["source"] == "OpenAI":
         tag = "OpenAI"
     elif HARDWARE_TOPIC_PATTERN.search(combined):
-        tag = "AI Hardware"
+        tag = "AI Hardware" if re.search(r"\b(ai|machine learning)\b", combined, re.I) else "Computer Hardware"
     elif ML_TOPIC_PATTERN.search(combined):
         tag = "Machine Learning"
-    else:
+    elif re.search(r"\b(ai|artificial intelligence)\b", combined, re.I):
         tag = "Artificial Intelligence"
+    else:
+        tag = SOURCE_CATEGORIES.get(topic["source"], "New Technology")
     return re.sub(r"[.&]+", "", tag).strip()[:50]
 
 
@@ -365,8 +403,24 @@ def _fetch_article_paragraphs(url: str, allowed_host: str, contact: str) -> list
         return []
 
 
+def _load_news_source(config: tuple, contact: str) -> dict:
+    """Fetch/normalize one publisher; errors stay isolated from other sources."""
+    source, url, host = config
+    started = time.monotonic()
+    try:
+        content, final_url, _ = fetch_source(url, host, contact)
+        if source in NEWSROOM_PATHS:
+            items, cache = load_newsroom(source, content, final_url, host, contact)
+        else:
+            items, cache = feed_items(content), {}
+        return {"config": config, "items": items, "cache": cache,
+                "size": len(content), "elapsed": time.monotonic() - started}
+    except (requests.RequestException, ET.ParseError, ValueError) as error:
+        return {"config": config, "error": type(error).__name__, "elapsed": time.monotonic() - started}
+
+
 def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
-    """Choose the newest unposted relevant story + rich context from official RSS feeds."""
+    """Choose fresh, unposted news with verified context from official publishers."""
     now = now or datetime.now(timezone.utc)
     hours = int(os.getenv("MAX_NEWS_AGE_HOURS", "72"))
     if not 1 <= hours <= 168:
@@ -376,34 +430,25 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
     contact = f"https://github.com/{repository}" if repository else "local preview"
     stories = {}
     successful_feeds = 0
+    article_cache = {}
 
     LOGGER.info(
-        "[1/6 Feeds] Scanning %d official RSS feeds | window=%dh | cutoff=%s",
+        "[1/6 Feeds] Scanning %d official feeds/newsrooms | window=%dh | cutoff=%s",
         len(NEWS_FEEDS),
         hours,
         cutoff.strftime("%Y-%m-%d %H:%M UTC"),
     )
 
-    for source, feed_url, allowed_host in NEWS_FEEDS:
-        feed_started = time.monotonic()
-        try:
-            response = requests.get(
-                feed_url,
-                headers={"User-Agent": f"DailyTechNewsBot/1.0 ({contact})"},
-                timeout=HTTP_TIMEOUT,
-            )
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
-            if root.tag != "rss" or root.find("channel") is None:
-                raise ValueError("Not an RSS feed.")
-        except (requests.RequestException, ET.ParseError, ValueError) as error:
-            status = getattr(getattr(error, "response", None), "status_code", None)
-            detail = f"HTTP {status}" if status is not None else type(error).__name__
-            LOGGER.warning("%s feed unavailable or invalid (%s, %.2fs); continuing.", source, detail, time.monotonic() - feed_started)
+    with ThreadPoolExecutor(max_workers=SOURCE_FETCH_WORKERS) as pool:
+        results = list(pool.map(lambda config: _load_news_source(config, contact), NEWS_FEEDS))
+    for result in results:
+        source, feed_url, allowed_host = result["config"]
+        if "error" in result:
+            LOGGER.warning("%s source unavailable or invalid (%s, %.2fs); continuing.", source, result["error"], result["elapsed"])
             continue
-
+        items = result["items"]
+        article_cache.update(result["cache"])
         successful_feeds += 1
-        items = root.findall("./channel/item")
         kept = 0
         skipped_topic = 0
         skipped_age = 0
@@ -412,22 +457,19 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
         for item in items:
             title = _clean_text(unescape(item.findtext("title", "")))
             link = item.findtext("link", "").strip()
-            if not TOPIC_PATTERN.search(title) or FINANCIAL_PATTERN.search(title):
+            if (
+                (not TOPIC_PATTERN.search(title) and (source not in SOURCE_CATEGORIES or source in REQUIRES_TECH_MATCH))
+                or FINANCIAL_PATTERN.search(title) or RUMOR_PATTERN.search(title)
+            ):
                 skipped_topic += 1
                 continue
             try:
-                published = parsedate_to_datetime(item.findtext("pubDate", ""))
-                url = urlsplit(link)
+                published = parse_date(item.findtext("pubDate", ""))
                 if published.tzinfo is None or not cutoff <= published <= now:
                     skipped_age += 1
                     continue
                 if (
-                    url.scheme != "https"
-                    or url.hostname != allowed_host
-                    or url.username is not None
-                    or url.password is not None
-                    or url.port not in (None, 443)
-                    or any(char.isspace() for char in link)
+                    not approved_url(link, allowed_host)
                 ):
                     skipped_url += 1
                     continue
@@ -457,6 +499,7 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
                 "content_blocks": rss_blocks,
                 "source_url": link,
                 "published": published.astimezone(timezone.utc),
+                "date_kind": item.get("date_kind", "published"),
             }
             story["topic_tag"] = _pick_topic_tag(story)
             story["discussion_prompt"] = _pick_discussion_question(story)
@@ -467,14 +510,14 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
             "[1/6 Feeds] %-18s | status=%s | payload=%.1fKB | items=%2d | kept=%2d | "
             "skipped(topic=%d, age=%d, url=%d) | %.2fs",
             source,
-            response.status_code,
-            len(response.content) / 1024.0,
+            200,
+            result["size"] / 1024.0,
             len(items),
             kept,
             skipped_topic,
             skipped_age,
             skipped_url,
-            time.monotonic() - feed_started,
+            result["elapsed"],
         )
 
     if not successful_feeds:
@@ -503,20 +546,37 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
 
     recent_texts = _fetch_recent_thread_texts()
     topic = None
+    checked = 0
     for candidate in ranked:
         if any(candidate["text"].lower() in prev for prev in recent_texts):
             LOGGER.info("[Dedup] Skipping already-posted story on Threads: %s", candidate["text"])
             continue
-        topic = candidate
-        break
+        if checked >= 5:
+            break  # Keep API time bounded; never publish unchecked candidates.
+        checked += 1
+        try:
+            document = article_cache.get(candidate["source_url"])
+            if document is not None:
+                candidate.update(verify_article(candidate, contact, now, hours, document=document))
+            else:
+                candidate.update(verify_article(candidate, contact, now, hours))
+        except (requests.RequestException, ValueError, ET.ParseError) as error:
+            LOGGER.warning("[Source check] Rejected %s article (%s): %s", candidate["source"], type(error).__name__, candidate["source_url"])
+            continue
+        candidate["topic_tag"] = _pick_topic_tag(candidate)
+        candidate["discussion_prompt"] = _pick_discussion_question(candidate)
+        if topic is None or candidate["published"] > topic["published"]:
+            topic = candidate  # Rank by confirmed publication, not a feed update.
     if topic is None:
-        LOGGER.info("All recent qualifying stories were already posted on Threads; skipping today.")
+        LOGGER.info("No unposted story passed the original-source checks; skipping today.")
         return None
 
     age_td = now - topic["published"]
     age_hrs = int(age_td.total_seconds() // 3600)
     age_mins = int((age_td.total_seconds() % 3600) // 60)
-    topic["paragraphs"] = _fetch_article_paragraphs(topic["source_url"], topic["allowed_host"], contact)
+    LOGGER.info("[Source check] Passed | checked=%s | SHA256=%s | date basis=%s",
+                topic["verification"]["checked_at"], topic["verification"]["sha256"],
+                topic["verification"]["publication_date_basis"])
     LOGGER.info(
         "Selected %s headline published %s (%dh %dm ago) | topic_tag=%s | summary=%d chars | paragraphs=%d | url=%s",
         topic["source"],
@@ -553,6 +613,9 @@ def _collect_context_blocks(topic: dict) -> list[str]:
         + list(topic.get("content_blocks") or [])
         + ([raw_summary] if raw_summary else [])
     )
+    if topic.get("verification"):
+        # Verified article paragraphs only: RSS blurbs may be stale or truncated.
+        candidates = list(topic.get("paragraphs") or [])
     for candidate in candidates:
         cleaned = candidate.strip()
         if not cleaned or len(cleaned) < 25:
@@ -687,10 +750,10 @@ def generate_thread(topic: dict) -> list[str]:
     """Generate an engaging 1- or 2-post Threads chain; optionally craft via Groq."""
     fallback = _build_template_thread(topic)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
+    if _parse_bool_env("STRICT_SOURCE_MODE", "true") == "true" or not api_key:
         weights = [f"{_post_weight(p)}/{MAX_POST_LENGTH}" for p in fallback]
         LOGGER.info(
-            "[3/6 Copy] Threads template ready | parts=%d | weights=%s (GROQ_API_KEY not set).",
+            "[3/6 Copy] Threads source-text template ready | parts=%d | weights=%s.",
             len(fallback),
             weights,
         )
@@ -828,10 +891,10 @@ def generate_instagram_caption(topic: dict) -> str:
     """Generate an Instagram feed caption pairing with the multi-card 1080x1350 carousel."""
     fallback = _build_instagram_caption_template(topic)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
+    if _parse_bool_env("STRICT_SOURCE_MODE", "true") == "true" or not api_key:
         first_line = fallback.splitlines()[0] if fallback else ""
         LOGGER.info(
-            "[3/6 Copy] Instagram template caption ready | hook=%d/125 chars | total=%d/%d (GROQ_API_KEY not set).",
+            "[3/6 Copy] Instagram source-text caption ready | hook=%d/125 chars | total=%d/%d.",
             len(first_line),
             len(fallback),
             MAX_IG_CAPTION_LENGTH,
@@ -1464,6 +1527,16 @@ def _write_github_step_summary(
             f"- **Published:** `{topic['published'].isoformat()}` | **Tag:** `{topic.get('topic_tag', '')}`",
             f"- **Source URL:** {topic['source_url']}",
         ])
+        if topic.get("verification"):
+            evidence = topic["verification"]
+            lines.extend([
+                f"- **Source checked (UTC):** `{evidence['checked_at']}`",
+                f"- **Page SHA256:** `{evidence['sha256']}`",
+                f"- **Date basis:** {evidence['publication_date_basis']}",
+                "- **Check scope:** Original publisher, matching headline, freshness and source wording. Publisher claims are attributed, not independently proven.",
+            ])
+        for price in topic.get("price_evidence", []):
+            lines.append(f"- **Price context:** {price['market']} / {price['currency']} / {price['basis']} / published {topic['published']:%Y-%m-%d}; not a live retail quote.")
     if posts:
         lines.extend(["", "### Threads Preview", ""])
         for idx, part in enumerate(posts, start=1):
