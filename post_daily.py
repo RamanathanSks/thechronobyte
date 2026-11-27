@@ -22,33 +22,40 @@ from urllib.parse import urljoin, urlsplit
 import requests
 from news_sources import (
     NEWS_FEEDS, SOURCE_CATEGORIES, PRICE_PATTERN, RUMOR_PATTERN,
+    UPCOMING_PATTERN, DEALS_SPAM_PATTERN,
     NEWSROOM_PATHS, REQUIRES_TECH_MATCH,
     fetch_source, feed_items, parse_date, verify_article, load_newsroom, approved_url,
     approved_image_url, fetch_image_bytes, enrich_theme_from_stylesheets,
+    is_rumor_story, fetch_google_trends,
 )
 
 LOGGER = logging.getLogger(__name__)
-SOURCE_FETCH_WORKERS = 6  # Bounded parallel reads keep the daily job short.
+SOURCE_FETCH_WORKERS = 10  # Bounded parallel reads keep the expanded 46-source scan fast.
 SOURCE_EMOJIS = {
-    "OpenAI": "⚡",
-    "NVIDIA": "⚙️",
-    "Google AI": "🧠",
-    "AMD": "🚀",
-    "Microsoft Research": "🔬",
-    "Apple": "📱", "Meta": "🌐", "Microsoft": "💻", "Xbox": "🎮",
-    "PlayStation": "🎮", "Samsung": "📱", "Google Devices": "📱", "NASA": "🚀",
+    "OpenAI": "⚡", "NVIDIA": "⚙️", "Google AI": "🧠", "AMD": "🚀", "Microsoft Research": "🔬",
+    "Apple": "📱", "Meta": "🌐", "Microsoft": "💻", "Xbox": "🎮", "PlayStation": "🎮",
+    "Samsung": "📱", "Google Devices": "📱", "NASA": "🚀", "Amazon": "📦", "AWS": "☁️",
+    "AWS Machine Learning": "🤖", "Google DeepMind": "🧠", "GitHub": "🧑‍💻", "Cloudflare": "🛡️",
+    "Cisco": "📡", "Salesforce": "💼", "Stripe": "💳", "Mozilla": "🦊", "IBM": "🖥️",
+    "Figma": "🎨", "Anthropic": "✨", "Notion": "📝", "JPMorganChase": "🏦", "Comcast": "📡",
+    "IGN": "🎮", "Eurogamer": "🎮", "PC Gamer": "🕹️", "Polygon": "🎮",
+    "9to5Mac": "🍎", "9to5Google": "📱", "Android Authority": "📱", "Android Police": "📱",
+    "MacRumors": "👀", "The Verge": "⚡", "TechCrunch": "🚀", "Tom's Hardware": "⚙️",
+    "XDA Developers": "📱", "Engadget": "🔌", "Gizmodo": "🛰️", "TechSpot": "🖥️",
+    "NotebookCheck": "🔮",
 }
 CONTENT_ENCODED_TAG = "{http://purl.org/rss/1.0/modules/content/}encoded"
 TOPIC_PATTERN = re.compile(
     r"\b(ai|artificial intelligence|machine learning|ml|cpus?|gpus?|processors?|"
     r"semiconductors?|chips?|llms?|generative|neural|chatgpt|gpt-\d\w*|gemini|"
-    r"deepmind|cuda|blackwell|rubin|geforce|radeon|ryzen|epyc|xeon|"
-    r"ram|memory|ddr[3456]|gddr\d|gaming|games?|xbox|playstation|nintendo|"
-    r"smartphones?|iphone|android|galaxy|pixel|apple|meta|microsoft|"
-    r"spacecraft|satellites?|rockets?|missions?|robotics|quantum|technology|"
-    r"cloud|cybersecurity|security|software|data centers?|broadband|wi-fi|wifi|"
-    r"internet|streaming|devices?|alexa|aws|kindle|payments|fintech|developers?|"
-    r"claude|anthropic|figma|notion|copilot|agents?|productivity|automation|apis?)\b", re.I,
+    r"deepmind|cuda|blackwell|rubin|geforce|rtx\s*\d+|radeon|ryzen|epyc|xeon|intel|snapdragon|qualcomm|mediatek|"
+    r"ram|memory|ddr[3456]|gddr\d|ssd|oled|gaming|games?|xbox|playstation|ps[456]|nintendo|switch|steam|valve|gta|"
+    r"smartphones?|iphone|ipad|macbook|ios|android|galaxy|pixel|oneplus|xiaomi|nothing phone|apple|meta|microsoft|sony|"
+    r"spacecraft|satellites?|rockets?|starship|spacex|missions?|robotics|quantum|technology|"
+    r"cloud|cybersecurity|security|software|data centers?|broadband|wi-fi|wifi|5g|6g|"
+    r"internet|streaming|devices?|wearables?|smartwatch|vr|ar|headset|alexa|aws|kindle|payments|fintech|developers?|"
+    r"claude|anthropic|figma|notion|copilot|agents?|productivity|automation|apis?|"
+    r"upcoming|next[- ]gen|rumou?rs?|leaks?|leaked|unconfirmed|prototype|flagship)\b", re.I,
 )
 FINANCIAL_PATTERN = re.compile(r"\b(earnings|financial results|dividends?|stockholders?|shareholders?)\b", re.I)
 HARDWARE_TOPIC_PATTERN = re.compile(
@@ -91,49 +98,136 @@ VALID_REPLY_CONTROLS = frozenset({
 })
 DISCUSSION_PROMPTS = {
     "OpenAI": (
-        "Would you rely on this in your daily workflow, or wait for wider rollout?",
-        "How big of a shift is this for how people use AI tools day to day?",
-        "Curious where you see this helping most — personal use or enterprise teams?",
+        "Would you rely on this in your daily workflow, or wait for wider rollout? 👇",
+        "Genuine game-changer or just incremental hype? Drop your take 👇",
+        "Where do you see this helping most — personal use or teams? 👇",
     ),
     "Google Gemini": (
-        "How do you think this stacks up against the other flagship models right now?",
-        "Would this change how you search, code, or research every day?",
-        "What's the first task you'd put this to the test on?",
+        "How does this stack up against ChatGPT and Claude right now? 👇",
+        "Would this change how you search, code, or research every day? 👇",
+        "What's the first thing you'd test this on? 👇",
+    ),
+    "Claude": (
+        "Team Claude, ChatGPT, or Gemini right now — does this change your pick? 👇",
+        "Would you switch your daily workflow over to this? 👇",
+        "Big step forward or still missing something key? Tell me below 👇",
     ),
     "AI Hardware": (
-        "What matters more to you right now: raw compute speed or efficiency per watt?",
-        "How much does hardware like this unlock for local and edge AI?",
-        "Big infrastructure move — curious what workloads benefit most from this.",
+        "What matters more right now: raw compute speed or efficiency per watt? 👇",
+        "How much does hardware like this unlock for local & edge AI? 👇",
+        "Massive silicon move — which workloads win biggest here? 👇",
     ),
     "Machine Learning": (
-        "Do you see ideas like this hitting production tools soon?",
-        "Which real-world problem needs breakthroughs like this the most?",
-        "Interesting direction — how quickly do you think this scales?",
+        "How fast do you see ideas like this hitting everyday apps? 👇",
+        "Which real-world problem needs breakthroughs like this most? 👇",
+        "Real leap forward or lab demo for now? Drop your take 👇",
     ),
     "Artificial Intelligence": (
-        "What's your take — genuine step forward or incremental polish?",
-        "Where do you think this has the biggest real-world impact this year?",
-        "Would you adopt this early or wait to see how it holds up in practice?",
+        "Hot take time — genuine breakthrough or overhyped? 👇",
+        "Would you adopt this on Day 1 or wait to see how it holds up? 👇",
+        "Where does this hit hardest in 2026–2027? 👇",
+    ),
+    "Video Games": (
+        "Day-1 play, wait for reviews, or easy skip? Drop your pick 👇",
+        "W update or L move for players? Be honest 👇",
+        "Does this actually get you hyped to boot up your console/PC? 👇",
+        "What's the ONE feature you're still waiting for here? 👇",
+    ),
+    "Mobile Phones": (
+        "Upgrade-worthy or keeping your current phone another year? 👇",
+        "Does this beat your current daily driver, or nah? 👇",
+        "Spec bump or genuinely useful everyday upgrade — what do you think? 👇",
+        "Team iOS or Team Android — how does this look from your side? 👇",
+    ),
+    "Upcoming Tech": (
+        "Hyped for this release or waiting for real-world benchmarks first? 👇",
+        "If this ships as teased, is it an instant cop or a wait-and-see? 👇",
+        "What price point would actually make this worth buying? 👇",
+    ),
+    "Tech Rumors": (
+        "Buying this rumor or calling cap until it's official? 👇",
+        "If this leak turns out true, huge W or underwhelming? 👇",
+        "Scale of 1–10: how believable is this rumor to you? 👇",
+    ),
+    "Computer Hardware": (
+        "Worth upgrading your rig for, or holding onto your current setup? 👇",
+        "Raw performance or lower thermals/price — what wins your vote? 👇",
+        "Is this the upgrade PC builders were actually waiting for? 👇",
+    ),
+    "Component Prices": (
+        "Fair pricing for the specs, or totally out of touch? 👇",
+        "Buying at launch price or waiting for street discounts? 👇",
+    ),
+    "Space Programs": (
+        "What's the space milestone you're most excited to watch live next? 👇",
+        "Wild milestone — how close are we to seeing this go routine? 👇",
+    ),
+    "Tech Industry": (
+        "Smart move or misstep — where do you land on this? 👇",
+        "Would you actually use this, or does it feel unnecessary? 👇",
+        "Big W or hard pass? Drop your take below 👇",
+    ),
+    "New Technology": (
+        "Cool future tech you'd actually use, or gimmick? 👇",
+        "How many years before this becomes mainstream? 👇",
+    ),
+    "Design Tools": (
+        "Designers — does this speed up your workflow or add clutter? 👇",
+        "Switching over or sticking with your current stack? 👇",
+    ),
+    "Productivity": (
+        "Would this actually save you hours every week, or just another app? 👇",
+        "Clean upgrade or feature bloat? Tell me below 👇",
+    ),
+    "Cloud Computing": (
+        "Devs & infra folks — big win for your stack or overkill? 👇",
+        "Does this move the needle for your cloud deployments? 👇",
+    ),
+    "Developer Tools": (
+        "Devs — trying this today or sticking to what already works? 👇",
+        "Genuine DX upgrade or hype? Drop your take 👇",
+    ),
+    "Cybersecurity": (
+        "Are we finally closing these gaps, or just playing catch-up? 👇",
+        "Does this change how you lock down your own devices/accounts? 👇",
+    ),
+    "Financial Technology": (
+        "Would you trust this with your everyday payments? 👇",
+        "Big convenience upgrade or privacy concern? 👇",
+    ),
+    "Connectivity": (
+        "Would you actually notice this speed jump day to day? 👇",
+        "Ready to upgrade your home/mobile setup for this? 👇",
     ),
 }
 HOOK_TEMPLATES = (
-    "{emoji} According to {source} ({date_label}): {title}",
-    "{emoji} From {source} ({date_label}): {title}",
-    "{emoji} {source} reports ({date_label}): {title}",
+    "{emoji} {source} just dropped: {title}",
+    "🔥 Fresh from {source}: {title}",
+    "⚡ Big update ({source}): {title}",
+    "{emoji} {title} ({source} · {date_label})",
+)
+RUMOR_HOOK_TEMPLATES = (
+    "👀 RUMOR (Unconfirmed): {title} (via {source})",
+    "🚨 LEAK / RUMOR — Take with a grain of salt: {title} (via {source})",
+    "⚠️ UNCONFIRMED RUMOR ({source}): {title}",
 )
 FOLLOWUP_INTROS = (
-    "More from the announcement ↓",
-    "Key context from the release ↓",
-    "Closer look at the details ↓",
+    "📌 More key details 👇",
+    "⚡ Quick breakdown 👇",
+    "🔍 Worth noting 👇",
 )
 IG_HOOK_TEMPLATES = (
-    "{emoji} {source} ({date_label}) — here is what changed ↓",
-    "{emoji} Inside the new {source} announcement ({date_label}) ↓",
-    "{emoji} Verified from {source} ({date_label}) — swipe the breakdown ↓",
+    "{emoji} {source} ({date_label}) — quick breakdown ↓",
+    "🔥 Just in from {source} ({date_label}) ↓",
+    "⚡ Inside the {source} update ({date_label}) — swipe ↓",
+)
+IG_RUMOR_HOOK_TEMPLATES = (
+    "👀 RUMOR ALERT (Unconfirmed) · via {source} ({date_label}) ↓",
+    "⚠️ UNCONFIRMED LEAK / RUMOR · via {source} ({date_label}) ↓",
 )
 IG_THREAD_CTAS = (
-    "🔗 Clickable source link & full discussion on @thechronobyte Threads (link in bio).",
-    "🔗 Direct official link + ongoing thread on @thechronobyte Threads (link in bio).",
+    "🔗 Clickable source link & live discussion on @thechronobyte Threads (link in bio).",
+    "🔗 Direct source link + full thread on @thechronobyte Threads (link in bio).",
     "🔗 Tap the link in bio or follow @thechronobyte on Threads for the direct source link.",
 )
 IG_SOURCE_HASHTAGS = {
@@ -142,6 +236,30 @@ IG_SOURCE_HASHTAGS = {
     "Google AI": ("#GoogleAI", "#GeminiAI"),
     "AMD": ("#AMD", "#AMDRadeon"),
     "Microsoft Research": ("#MicrosoftResearch", "#AzureAI"),
+    "Apple": ("#Apple", "#AppleNews"),
+    "Samsung": ("#Samsung", "#SamsungGalaxy"),
+    "PlayStation": ("#PlayStation", "#PS5"),
+    "Xbox": ("#Xbox", "#XboxGaming"),
+    "Meta": ("#Meta", "#Instagram"),
+    "Anthropic": ("#Anthropic", "#ClaudeAI"),
+    "NASA": ("#NASA", "#SpaceExploration"),
+    "IGN": ("#GamingNews", "#IGN"),
+    "Eurogamer": ("#GamingNews", "#VideoGames"),
+    "PC Gamer": ("#PCGaming", "#GamingNews"),
+    "Polygon": ("#GamingNews", "#VideoGames"),
+    "9to5Mac": ("#AppleNews", "#iPhone"),
+    "9to5Google": ("#AndroidNews", "#GooglePixel"),
+    "Android Authority": ("#Android", "#MobileNews"),
+    "Android Police": ("#Android", "#MobileTech"),
+    "MacRumors": ("#AppleRumors", "#TechRumors"),
+    "The Verge": ("#TechNews", "#Gadgets"),
+    "TechCrunch": ("#TechNews", "#Startups"),
+    "Tom's Hardware": ("#PCHardware", "#HardwareNews"),
+    "XDA Developers": ("#Android", "#MobileTech"),
+    "Engadget": ("#TechNews", "#Gadgets"),
+    "Gizmodo": ("#TechNews", "#FutureTech"),
+    "TechSpot": ("#PCGaming", "#TechNews"),
+    "NotebookCheck": ("#UpcomingTech", "#TechLeaks"),
 }
 IG_TOPIC_HASHTAGS = {
     "OpenAI": ("#GenerativeAI", "#LLM"),
@@ -149,13 +267,12 @@ IG_TOPIC_HASHTAGS = {
     "AI Hardware": ("#AIHardware", "#GPUs", "#Semiconductors"),
     "Machine Learning": ("#MachineLearning", "#DeepLearning"),
     "Artificial Intelligence": ("#ArtificialIntelligence", "#TechInnovation"),
-}
-IG_BASE_HASHTAGS = ("#TechNews", "#TheChronoByte")
-IG_TOPIC_HASHTAGS.update({
-    "Video Games": ("#Gaming", "#VideoGames"),
-    "Mobile Phones": ("#Smartphones", "#MobileTech"),
+    "Video Games": ("#Gaming", "#GamingNews", "#VideoGames"),
+    "Mobile Phones": ("#Smartphones", "#MobileNews", "#MobileTech"),
+    "Upcoming Tech": ("#UpcomingTech", "#FutureTech", "#TechLaunch"),
+    "Tech Rumors": ("#TechRumors", "#TechLeaks", "#RumorAlert"),
     "Component Prices": ("#HardwarePrices", "#PCComponents"),
-    "Computer Hardware": ("#Hardware", "#PCComponents"),
+    "Computer Hardware": ("#Hardware", "#PCComponents", "#PCBuild"),
     "Tech Industry": ("#Technology", "#TechIndustry"),
     "Space Programs": ("#Space", "#SpaceTechnology"),
     "New Technology": ("#Technology", "#Innovation"),
@@ -167,12 +284,8 @@ IG_TOPIC_HASHTAGS.update({
     "Cybersecurity": ("#Cybersecurity", "#Security"),
     "Financial Technology": ("#FinTech", "#Technology"),
     "Connectivity": ("#Networking", "#Connectivity"),
-})
-for _tag in ("Video Games", "Mobile Phones", "Component Prices", "Computer Hardware",
-             "Tech Industry", "Space Programs", "New Technology", "Claude", "Design Tools",
-             "Productivity", "Cloud Computing", "Developer Tools", "Cybersecurity",
-             "Financial Technology", "Connectivity"):
-    DISCUSSION_PROMPTS[_tag] = ("Which detail in this announcement matters most to you?",)
+}
+IG_BASE_HASHTAGS = ("#TechNews", "#TheChronoByte")
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -408,16 +521,52 @@ def _shorten(text: str, limit: int) -> str:
     return shortened.rstrip(" ,;:-") + "…"
 
 
+_ENTITY_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "into", "over", "after", "before", "about",
+    "that", "this", "these", "those", "here", "what", "when", "where", "your", "their",
+    "more", "most", "just", "now", "today", "new", "next", "first", "latest", "best",
+    "how", "why", "will", "could", "might", "may", "comes", "coming", "update", "report",
+    "reports", "says", "announces", "announced", "launches", "launched", "introducing",
+    "official", "news", "video", "game", "games", "version", "release", "features",
+    "support", "india", "global", "world", "ways", "watch", "together", "makes",
+    "pro", "max", "ultra", "plus", "air", "mini", "lite", "edition", "series", "model",
+})
+_PR_FLUFF_PATTERN = re.compile(
+    r"\b(a global leader in|reinforces (?:our|its) commitment|as part of (?:our|its) vision|"
+    r"we are (?:thrilled|excited|proud) to announce|for more information,? visit|"
+    r"continues to innovate|stay tuned for more)\b",
+    re.I,
+)
+_HIGH_SIGNAL_FACT_PATTERN = re.compile(
+    r"\b(\d+(?:\.\d+)?(?:x|%|gb|tb|hz|fps|mah|nm|w|m|b|k)?|launch(?:es|ing)?|available|"
+    r"ships?|starting|supports?|introduces?|adds?|features?|leaks?|rumou?red|ps5|ps6|"
+    r"xbox|switch|iphone|galaxy|pixel|android|ios|rtx|ryzen|snapdragon|blackwell|rubin)\b",
+    re.I,
+)
+_KNOWN_ENTITY_RE = re.compile(
+    r"\b(?:PlayStation\s*\d?|PS[456]|Xbox(?:\s+Series\s+[XS])?|Nintendo\s+Switch\s*\d?|"
+    r"Steam\s+Deck|GTA\s*(?:VI|6)|iPhone\s*\d+\s*(?:Pro|Max|Air|Ultra)?|"
+    r"Galaxy\s*(?:S|Z\s*Fold|Z\s*Flip|Tab)\s*\d*\s*(?:Ultra|FE|Plus)?|"
+    r"Pixel\s*\d+\s*(?:Pro|Fold|a)?|iOS\s*\d+|Android\s*\d+|macOS|Windows\s*\d+|"
+    r"RTX\s*\d{4}\s*(?:Ti|Super)?|GeForce\s+NOW|Radeon\s+RX\s*\d+|Ryzen\s*\d+|"
+    r"Snapdragon\s*\d+(?:\s*Elite|\s*Gen\s*\d)?|ChatGPT|GPT-\d\w*|Claude\s*\d*(?:\.\d)?|"
+    r"Gemini\s*\d*(?:\.\d)?|Apple\s+Vision\s+Pro|Starship|Artemis|Blackwell|Rubin)\b",
+    re.I,
+)
+
+
 def _pick_topic_tag(topic: dict) -> str:
-    """Select a Threads topic_tag (1-50 chars, no '.' or '&')."""
+    """Select a clean Threads topic_tag (1-50 chars, no '.' or '&')."""
     combined = f"{topic['text']} {topic.get('summary', '')}"
     if PRICE_PATTERN.search(topic["text"]) and HARDWARE_TOPIC_PATTERN.search(combined):
         tag = "Component Prices"
-    elif topic["source"] in {"NASA"} or re.search(r"\b(spacecraft|rocket|satellite|artemis)\b", combined, re.I):
+    elif topic["source"] in {"NASA"} or re.search(r"\b(spacecraft|rocket|satellite|artemis|starship)\b", combined, re.I):
         tag = "Space Programs"
-    elif re.search(r"\b(smartphones?|iphone|galaxy|pixel\s+\d|mobile phones?)\b", combined, re.I):
+    elif re.search(r"\b(smartphones?|iphone|galaxy|pixel\s+\d|mobile phones?|android\s+\d+|ios\s+\d+)\b", combined, re.I):
         tag = "Mobile Phones"
-    elif topic["source"] in {"Xbox", "PlayStation"} or re.search(r"\b(video games?|gaming|gameplay)\b", combined, re.I):
+    elif topic["source"] in {"Xbox", "PlayStation", "IGN", "Eurogamer", "PC Gamer", "Polygon"} or re.search(
+        r"\b(video games?|gaming|gameplay|ps5|ps6|nintendo switch|gta\s*(?:vi|6))\b", combined, re.I
+    ):
         tag = "Video Games"
     elif topic["source"] == "Anthropic" or re.search(r"\bclaude\b", combined, re.I):
         tag = "Claude"
@@ -431,9 +580,103 @@ def _pick_topic_tag(topic: dict) -> str:
         tag = "Machine Learning"
     elif re.search(r"\b(ai|artificial intelligence)\b", combined, re.I):
         tag = "Artificial Intelligence"
+    elif topic.get("is_rumor") or RUMOR_PATTERN.search(topic["text"]):
+        tag = "Tech Rumors"
+    elif UPCOMING_PATTERN.search(combined):
+        tag = "Upcoming Tech"
     else:
         tag = SOURCE_CATEGORIES.get(topic["source"], "New Technology")
     return re.sub(r"[.&]+", "", tag).strip()[:50]
+
+
+def _extract_cross_feed_trends(stories: dict[str, dict]) -> list[str]:
+    """Identify recurring hot entities/topics appearing across 2+ distinct publishers right now."""
+    entity_sources: dict[str, set[str]] = {}
+    display_form: dict[str, str] = {}
+    for story in stories.values():
+        title = story.get("text", "")
+        src = story.get("source", "")
+        hits = [m.group(0).strip() for m in _KNOWN_ENTITY_RE.finditer(title)]
+        hits += re.findall(r"\b[A-Z][a-zA-Z0-9]+(?:\s+[A-Z0-9][a-zA-Z0-9]+){0,1}\b", title)
+        for term in hits:
+            clean = " ".join(term.split())
+            low = clean.lower()
+            if len(clean) < 3 or low in _ENTITY_STOPWORDS or all(w in _ENTITY_STOPWORDS for w in low.split()):
+                continue
+            entity_sources.setdefault(low, set()).add(src)
+            display_form.setdefault(low, clean)
+    ranked = sorted(
+        ((len(srcs), display_form[k]) for k, srcs in entity_sources.items() if len(srcs) >= 2),
+        key=lambda pair: (-pair[0], -len(pair[1]), pair[1]),
+    )
+    return [term for _, term in ranked[:25]]
+
+
+def _extract_story_entities(topic: dict, max_entities: int = 4) -> list[str]:
+    """Extract clean named tech/game/product entities from a story title for trend matching & hashtags."""
+    title = _clean_text(topic.get("text", ""))
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _KNOWN_ENTITY_RE.finditer(title):
+        term = " ".join(match.group(0).split())
+        if term.lower() not in seen:
+            seen.add(term.lower())
+            found.append(term)
+    for match in re.finditer(r"\b[A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)?\b", title):
+        term = " ".join(match.group(0).split())
+        words = term.lower().split()
+        if len(term) < 3 or any(w in _ENTITY_STOPWORDS for w in words):
+            continue
+        if any(term.lower() in existing.lower() for existing in found):
+            continue
+        if term.lower() not in seen:
+            seen.add(term.lower())
+            found.append(term)
+        if len(found) >= max_entities:
+            break
+    return found[:max_entities]
+
+
+def _resolve_trending_topic_tag(topic: dict, trending_terms: list[str]) -> tuple[str, list[str]]:
+    """Match live Google Trends + cross-feed buzz to this story for Threads topic_tag & IG hashtags."""
+    haystack = f"{topic.get('text', '')} {' '.join((topic.get('paragraphs') or [])[:2])}".lower()
+    matched_trends: list[str] = []
+    seen: set[str] = set()
+    for term in trending_terms:
+        clean = re.sub(r"[.&]+", "", " ".join(term.split())).strip()
+        low = clean.lower()
+        if len(clean) < 3 or low in seen or low in _ENTITY_STOPWORDS:
+            continue
+        if re.search(rf"(?<!\w){re.escape(low)}(?!\w)", haystack):
+            seen.add(low)
+            matched_trends.append(clean)
+
+    base_tag = _pick_topic_tag(topic)
+    if matched_trends:
+        # Use the strongest live trending phrase directly as Threads' topic_tag!
+        chosen = matched_trends[0][:50]
+    else:
+        known_hit = _KNOWN_ENTITY_RE.search(topic.get("text", ""))
+        chosen = re.sub(r"[.&]+", "", known_hit.group(0)).strip()[:50] if known_hit else base_tag
+    return chosen or base_tag, matched_trends[:5]
+
+
+def _to_hashtag(term: str) -> str | None:
+    """Convert a trending topic or entity name into a clean CamelCase Instagram hashtag."""
+    parts = re.findall(r"[A-Za-z0-9]+", term)
+    if not parts:
+        return None
+    formatted = []
+    for p in parts:
+        has_internal_upper = any(c.isupper() for c in p[1:])
+        if p.isupper() or has_internal_upper or any(c.isdigit() for c in p):
+            formatted.append(p)
+        else:
+            formatted.append(p.capitalize())
+    joined = "".join(formatted)
+    if len(joined) < 2 or len(joined) > 28 or joined.isdigit():
+        return None
+    return f"#{joined}"
 
 
 def _story_seed(topic: dict) -> int:
@@ -443,10 +686,14 @@ def _story_seed(topic: dict) -> int:
 
 
 def _pick_discussion_question(topic: dict) -> str:
-    """Select the deterministic reader prompt shared across Threads, IG captions, and closing cards."""
+    """Select the deterministic interactive reader prompt shared across Threads, IG captions, and closing cards."""
     seed = _story_seed(topic)
-    topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
-    prompts = DISCUSSION_PROMPTS.get(topic_tag, DISCUSSION_PROMPTS["Artificial Intelligence"])
+    if topic.get("is_rumor"):
+        prompts = DISCUSSION_PROMPTS["Tech Rumors"]
+        return prompts[seed % len(prompts)]
+    base_tag = _pick_topic_tag(topic)
+    topic_tag = topic.get("topic_tag") or base_tag
+    prompts = DISCUSSION_PROMPTS.get(topic_tag) or DISCUSSION_PROMPTS.get(base_tag) or DISCUSSION_PROMPTS["Artificial Intelligence"]
     return prompts[seed % len(prompts)]
 
 
@@ -567,7 +814,13 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
     )
 
     with ThreadPoolExecutor(max_workers=SOURCE_FETCH_WORKERS) as pool:
+        trends_future = (
+            pool.submit(fetch_google_trends, ("US", "IN"), contact)
+            if len(NEWS_FEEDS) > 5 and os.getenv("ENABLE_GOOGLE_TRENDS", "true").strip().lower() == "true"
+            else None
+        )
         results = list(pool.map(lambda config: _load_news_source(config, contact), NEWS_FEEDS))
+        google_trends = trends_future.result() if trends_future is not None else []
     for result in results:
         source, feed_url, allowed_host = result["config"]
         if "error" in result:
@@ -586,7 +839,8 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
             link = item.findtext("link", "").strip()
             if (
                 (not TOPIC_PATTERN.search(title) and (source not in SOURCE_CATEGORIES or source in REQUIRES_TECH_MATCH))
-                or FINANCIAL_PATTERN.search(title) or RUMOR_PATTERN.search(title)
+                or FINANCIAL_PATTERN.search(title)
+                or DEALS_SPAM_PATTERN.search(title)
             ):
                 skipped_topic += 1
                 continue
@@ -628,6 +882,7 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
                 "source_url": link,
                 "published": published.astimezone(timezone.utc),
                 "date_kind": item.get("date_kind", "published"),
+                "is_rumor": is_rumor_story(title, source),
             }
             story["topic_tag"] = _pick_topic_tag(story)
             story["discussion_prompt"] = _pick_discussion_question(story)
@@ -672,14 +927,25 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
             candidate["text"],
         )
 
+    cross_feed_trends = _extract_cross_feed_trends(stories)
+    trending_terms = list(dict.fromkeys(google_trends + cross_feed_trends))
+    if trending_terms:
+        LOGGER.info(
+            "[1/6 Trends] Collected %d Google Trends + %d cross-feed buzz term(s): %s",
+            len(google_trends),
+            len(cross_feed_trends),
+            ", ".join(trending_terms[:8]),
+        )
+
     recent_texts = _fetch_recent_thread_texts()
     topic = None
     checked = 0
+    max_checks = 8 if len(NEWS_FEEDS) > 5 else 5
     for candidate in ranked:
         if any(candidate["text"].lower() in prev for prev in recent_texts):
             LOGGER.info("[Dedup] Skipping already-posted story on Threads: %s", candidate["text"])
             continue
-        if checked >= 5:
+        if checked >= max_checks:
             break  # Keep API time bounded; never publish unchecked candidates.
         checked += 1
         try:
@@ -691,6 +957,9 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
         except (requests.RequestException, ValueError, ET.ParseError) as error:
             LOGGER.warning("[Source check] Rejected %s article (%s): %s", candidate["source"], type(error).__name__, candidate["source_url"])
             continue
+        candidate["is_rumor"] = bool(
+            candidate.get("is_rumor") or is_rumor_story(candidate["text"], candidate["source"], candidate.get("paragraphs"))
+        )
         candidate["topic_tag"] = _pick_topic_tag(candidate)
         candidate["discussion_prompt"] = _pick_discussion_question(candidate)
         if topic is None or candidate["published"] > topic["published"]:
@@ -699,6 +968,12 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
         LOGGER.info("No unposted story passed the original-source checks; skipping today.")
         return None
 
+    trending_tag, matched_trends = _resolve_trending_topic_tag(topic, trending_terms)
+    topic["matched_trends"] = matched_trends
+    if len(NEWS_FEEDS) > 5 or matched_trends:
+        topic["topic_tag"] = trending_tag
+    topic["discussion_prompt"] = _pick_discussion_question(topic)
+
     age_td = now - topic["published"]
     age_hrs = int(age_td.total_seconds() // 3600)
     age_mins = int((age_td.total_seconds() % 3600) // 60)
@@ -706,13 +981,14 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
                 topic["verification"]["checked_at"], topic["verification"]["sha256"],
                 topic["verification"]["publication_date_basis"])
     LOGGER.info(
-        "Selected %s headline published %s (%dh %dm ago) | topic_tag=%s | summary=%d chars | paragraphs=%d | url=%s",
+        "Selected %s headline published %s (%dh %dm ago) | topic_tag=%s | rumor=%s | matched_trends=%s | paragraphs=%d | url=%s",
         topic["source"],
         topic["published"].isoformat(),
         age_hrs,
         age_mins,
         topic["topic_tag"],
-        len(topic.get("summary") or ""),
+        "YES" if topic.get("is_rumor") else "no",
+        matched_trends or "none",
         len(topic["paragraphs"]),
         topic["source_url"],
     )
@@ -777,64 +1053,119 @@ def _prepare_context_blocks(topic: dict) -> list[str]:
     return blocks
 
 
+def _extract_crisp_points(topic: dict, max_points: int = 5) -> list[str]:
+    """Turn long article paragraphs into sharp, scannable, non-fluff fact points."""
+    blocks = _prepare_context_blocks(topic)
+    if not blocks:
+        return []
+    # When blocks are already concise (<= 3 blocks, all <= 230 chars), keep them crisp in order.
+    if len(blocks) <= 3 and all(len(b) <= 230 for b in blocks):
+        return blocks[:max_points]
+
+    title_words = {w for w in re.findall(r"[a-z0-9]{3,}", topic.get("text", "").lower()) if w not in _ENTITY_STOPWORDS}
+    scored: list[tuple[float, int, str]] = []
+    seen: set[str] = set()
+    idx = 0
+    for block in blocks:
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", block) if len(s.strip()) >= 32]
+        if not sentences:
+            sentences = [block]
+        for sent in sentences:
+            low = sent.lower()
+            if low[:55] in seen:
+                continue
+            seen.add(low[:55])
+            score = 1.0
+            if 50 <= len(sent) <= 170:
+                score += 1.2
+            elif len(sent) > 220:
+                score -= 0.7
+            if _HIGH_SIGNAL_FACT_PATTERN.search(sent):
+                score += 1.2
+            if title_words:
+                overlap = sum(1 for w in title_words if w in low)
+                score += min(2.0, overlap * 0.7)
+            if _PR_FLUFF_PATTERN.search(sent):
+                score -= 2.2
+            # Boost early story paragraphs so the lede stays grounded in the actual article.
+            if idx < 3:
+                score += 1.0
+            scored.append((score, idx, _shorten(sent, 185)))
+            idx += 1
+
+    top = sorted(scored, key=lambda item: (-item[0], item[1]))[:max_points]
+    top.sort(key=lambda item: item[1])  # Preserve chronological article flow.
+    return [text for _, _, text in top]
+
+
 def _build_template_thread(topic: dict) -> list[str]:
-    """Build an engaging 1- or 2-post Threads chain from the story and article context."""
+    """Build a crisp, emoji-accented, interactive 1- or 2-part Threads chain."""
     seed = _story_seed(topic)
-    emoji = SOURCE_EMOJIS.get(topic["source"], "🤖")
+    emoji = SOURCE_EMOJIS.get(topic["source"], "⚡")
+    is_rumor = bool(topic.get("is_rumor"))
     topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
     date_label = topic["published"].strftime("%b %d").replace(" 0", " ")
-    hook = HOOK_TEMPLATES[seed % len(HOOK_TEMPLATES)].format(
+
+    templates = RUMOR_HOOK_TEMPLATES if is_rumor else HOOK_TEMPLATES
+    hook = templates[seed % len(templates)].format(
         emoji=emoji,
         source=topic["source"],
         date_label=date_label,
         topic_tag=topic_tag,
         title=topic["text"],
     )
-    prompts = DISCUSSION_PROMPTS.get(topic_tag, DISCUSSION_PROMPTS["Artificial Intelligence"])
-    question = prompts[seed % len(prompts)]
-    blocks = _prepare_context_blocks(topic)
+    question = f"💬 {topic.get('discussion_prompt') or _pick_discussion_question(topic)}"
+    points = _extract_crisp_points(topic, max_points=5)
 
-    # Build Post 1: engaging hook + rich first block(s) within 500 chars.
-    used_blocks = 0
-    post1_body = hook
-    for block in blocks:
-        candidate = f"{post1_body}\n\n{block}"
+    # Build Post 1: punchy hook + crisp bullet facts within 500 bytes.
+    used_points = 0
+    post1_lines = [hook]
+    for pt in points:
+        bullet = f"▸ {pt}"
+        sep = "\n\n" if len(post1_lines) == 1 else "\n"
+        candidate = post1_lines[0] + ("\n\n" + "\n".join(post1_lines[1:] + [bullet]))
         if _post_weight(candidate) <= MAX_POST_LENGTH:
-            post1_body = candidate
-            used_blocks += 1
-        elif used_blocks == 0:
-            budget = MAX_POST_LENGTH - _post_weight(f"{post1_body}\n\n")
+            post1_lines.append(bullet)
+            used_points += 1
+        elif used_points == 0:
+            budget = MAX_POST_LENGTH - _post_weight(f"{post1_lines[0]}\n\n▸ ")
             if budget >= 60:
-                post1_body = f"{post1_body}\n\n{_shorten(block, budget)}"
-                used_blocks += 1
+                post1_lines.append(f"▸ {_shorten(pt, budget)}")
+                used_points += 1
             break
         else:
             break
 
-    # Check if remaining blocks have enough substance for a 2nd reply in the thread.
-    remaining = blocks[used_blocks:]
-    if remaining and sum(len(b) for b in remaining) >= 90:
-        intro = FOLLOWUP_INTROS[seed % len(FOLLOWUP_INTROS)]
-        post2_parts = [intro]
-        for block in remaining:
-            candidate = "\n\n".join(post2_parts + [block, question])
-            if _post_weight(candidate) <= MAX_POST_LENGTH:
-                post2_parts.append(block)
-            elif len(post2_parts) == 1:
-                budget = MAX_POST_LENGTH - _post_weight(f"{intro}\n\n\n\n{question}")
-                if budget >= 80:
-                    post2_parts.append(_shorten(block, budget))
+    post1_body = post1_lines[0] + ("\n\n" + "\n".join(post1_lines[1:]) if len(post1_lines) > 1 else "")
+
+    # Check if remaining points have enough substance for a punchy 2nd self-reply.
+    remaining = points[used_points:]
+    if remaining and sum(len(b) for b in remaining) >= 75:
+        intro = "⚠️ Unconfirmed rumor — more details 👇" if is_rumor else FOLLOWUP_INTROS[seed % len(FOLLOWUP_INTROS)]
+        bullets2: list[str] = []
+        for pt in remaining:
+            bullet = f"▸ {pt}"
+            body2 = f"{intro}\n\n" + "\n".join(bullets2 + [bullet]) + f"\n\n{question}"
+            if _post_weight(body2) <= MAX_POST_LENGTH:
+                bullets2.append(bullet)
+            elif not bullets2:
+                budget = MAX_POST_LENGTH - _post_weight(f"{intro}\n\n▸ \n\n{question}")
+                if budget >= 70:
+                    bullets2.append(f"▸ {_shorten(pt, budget)}")
                 break
             else:
                 break
-        if len(post2_parts) > 1:
-            post2_parts.append(question)
-            return [_shorten(post1_body, MAX_POST_LENGTH), _shorten("\n\n".join(post2_parts), MAX_POST_LENGTH)]
+        if bullets2:
+            post2_body = f"{intro}\n\n" + "\n".join(bullets2) + f"\n\n{question}"
+            return [_shorten(post1_body, MAX_POST_LENGTH), _shorten(post2_body, MAX_POST_LENGTH)]
 
-    # Single-post path: append the conversation prompt if it fits comfortably.
-    with_question = f"{post1_body}\n\n{question}"
+    # Single-post path: append rumor caution + interactive question if they fit comfortably.
+    tail = f"⚠️ Unconfirmed rumor for now.\n\n{question}" if is_rumor else question
+    with_question = f"{post1_body}\n\n{tail}"
     if _post_weight(with_question) <= MAX_POST_LENGTH:
         post1_body = with_question
+    elif _post_weight(f"{post1_body}\n\n{question}") <= MAX_POST_LENGTH:
+        post1_body = f"{post1_body}\n\n{question}"
     return [_shorten(post1_body, MAX_POST_LENGTH)]
 
 
@@ -931,13 +1262,31 @@ def generate_post(topic: dict) -> str:
     return generate_thread(topic)[0]
 
 
-def _pick_instagram_hashtags(topic: dict, max_tags: int = 7) -> str:
-    """Select curated, non-spammy niche hashtags ending with #TheChronoByte."""
+def _pick_instagram_hashtags(topic: dict, max_tags: int = 9) -> str:
+    """Build dynamic trending + story-entity + niche Instagram hashtags ending with #TheChronoByte."""
     brand_tag = "#TheChronoByte"
-    topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
+    base_topic = _pick_topic_tag(topic)
+    topic_tag = topic.get("topic_tag") or base_topic
+
+    dynamic_tags: list[str] = []
+    for trend in topic.get("matched_trends") or []:
+        ht = _to_hashtag(trend)
+        if ht:
+            dynamic_tags.append(ht)
+    for entity in _extract_story_entities(topic, max_entities=3):
+        ht = _to_hashtag(entity)
+        if ht:
+            dynamic_tags.append(ht)
+    if topic.get("is_rumor"):
+        dynamic_tags.extend(["#TechRumors", "#RumorAlert"])
+    if UPCOMING_PATTERN.search(topic.get("text", "")):
+        dynamic_tags.append("#UpcomingTech")
+
     candidates = (
-        IG_SOURCE_HASHTAGS.get(topic["source"], ())
+        tuple(dynamic_tags[:4])
+        + IG_SOURCE_HASHTAGS.get(topic["source"], ())
         + IG_TOPIC_HASHTAGS.get(topic_tag, ())
+        + IG_TOPIC_HASHTAGS.get(base_topic, ())
         + IG_BASE_HASHTAGS
     )
     unique: list[str] = []
@@ -972,18 +1321,20 @@ def _clean_multiline_caption(text: str) -> str:
 
 
 def _build_instagram_caption_template(topic: dict) -> str:
-    """Build a structured, detailed Instagram caption complementing a multi-card carousel."""
+    """Build a crisp, emoji-accented Instagram caption with trending hashtags and explicit rumor labeling."""
     seed = _story_seed(topic)
-    emoji = SOURCE_EMOJIS.get(topic["source"], "🤖")
+    emoji = SOURCE_EMOJIS.get(topic["source"], "⚡")
+    is_rumor = bool(topic.get("is_rumor"))
     topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
     date_label = topic["published"].strftime("%b %d").replace(" 0", " ")
-    hook = IG_HOOK_TEMPLATES[seed % len(IG_HOOK_TEMPLATES)].format(
+    hooks = IG_RUMOR_HOOK_TEMPLATES if is_rumor else IG_HOOK_TEMPLATES
+    hook = hooks[seed % len(hooks)].format(
         emoji=emoji,
         source=topic["source"],
         date_label=date_label,
         topic_tag=topic_tag,
     )
-    question = topic.get("discussion_prompt") or _pick_discussion_question(topic)
+    question = f"💬 {topic.get('discussion_prompt') or _pick_discussion_question(topic)}"
     footer = _instagram_footer(topic)
 
     body_budget = min(
@@ -991,23 +1342,31 @@ def _build_instagram_caption_template(topic: dict) -> str:
         MAX_IG_CAPTION_LENGTH - _post_weight(f"\n\n{footer}"),
     )
     sections = [hook]
-    blocks = _prepare_context_blocks(topic)
     headline = topic["text"].strip()
     if headline:
         sections.append(headline if headline[-1] in ".!?" else f"{headline}.")
+    if is_rumor:
+        sections.append("⚠️ Note: This is an unconfirmed rumor/leak — wait for official confirmation.")
 
-    for block in blocks:
-        candidate = "\n\n".join(sections + [block, "📑 Swipe through the cards for the full story breakdown.", question])
+    points = _extract_crisp_points(topic, max_points=5)
+    bullets: list[str] = []
+    swipe_cue = "👉 Swipe through the cards for the full visual breakdown."
+    for pt in points:
+        trial_bullets = "\n".join(bullets + [f"▸ {pt}"])
+        candidate = "\n\n".join(sections + [trial_bullets, swipe_cue, question])
         if _post_weight(candidate) <= body_budget:
-            sections.append(block)
-        else:
-            remaining = body_budget - _post_weight("\n\n".join(sections + ["", question]))
-            if len(sections) <= 3 and remaining >= 80:
-                sections.append(_shorten(block, remaining))
+            bullets.append(f"▸ {pt}")
+        elif not bullets:
+            remaining = body_budget - _post_weight("\n\n".join(sections + ["▸ ", question]))
+            if remaining >= 80:
+                bullets.append(f"▸ {_shorten(pt, remaining)}")
             break
+        else:
+            break
+    if bullets:
+        sections.append("\n".join(bullets))
 
-    swipe_cue = "📑 Swipe through the cards for the full breakdown."
-    if len(blocks) >= 2 and _post_weight("\n\n".join(sections + [swipe_cue, question])) <= body_budget:
+    if len(points) >= 2 and _post_weight("\n\n".join(sections + [swipe_cue, question])) <= body_budget:
         sections.append(swipe_cue)
     if _post_weight("\n\n".join(sections + [question])) <= body_budget:
         sections.append(question)

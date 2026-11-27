@@ -146,6 +146,15 @@ class CardGeneratorTests(unittest.TestCase):
             )
             self.assertTrue(legacy_out.is_file())
 
+            rumor_out = cg.render_news_card(
+                {**rich_topic, "is_rumor": True},
+                Path(tmpdir) / "rumor.jpg",
+                theme="dark_duotone",
+                source_images=[hero_landscape],
+                source_theme=css_theme,
+            )
+            self.assertNotEqual(legacy_out.read_bytes(), rumor_out.read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()

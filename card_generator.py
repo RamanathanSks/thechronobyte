@@ -1070,7 +1070,9 @@ def _render_cover(
     rule_fill = (255, 255, 255, 32) if dark else (20, 22, 24, 30)
     badge_bg = (24, 28, 36, 232) if dark else (*deep, 238)
     badge_outline = (*accent, 180) if dark else None
-    topic_tag = (_strip_invisible(topic.get("topic_tag") or "") or "TECH BRIEF").upper()
+    is_rumor = bool(topic.get("is_rumor"))
+    raw_tag = (_strip_invisible(topic.get("topic_tag") or "") or "TECH BRIEF").upper()
+    topic_tag = f"RUMOR  ·  {raw_tag}" if (is_rumor and "RUMOR" not in raw_tag) else raw_tag
     headline = _strip_invisible(topic["text"])
     hero_img = source_images[0]["image"] if source_images else None
 
@@ -1101,6 +1103,12 @@ def _render_cover(
         stack_top = max(510, 1188 - stack_h)
 
         canvas = _draw_kicker(canvas, topic_tag, margin_x, stack_top, {**spec, "dark_mode": True}, palette)
+        if is_rumor:
+            canvas, _ = _draw_pill(
+                canvas, "UNCONFIRMED RUMOR", CARD_WIDTH - margin_x, stack_top,
+                bg_fill=(232, 146, 28, 245), text_fill=(18, 14, 10, 255),
+                align_right=True, font_size=13, pad_x=13, height=30,
+            )
         draw = ImageDraw.Draw(canvas)
         h_end = _draw_text_lines(draw, h_lines, margin_x, stack_top + 44, h_step, h_font, (*LIGHT_PRIMARY, 255))
         draw.rectangle((margin_x, h_end + 12, margin_x + 76, h_end + 16), fill=(*accent, 255))
@@ -1108,7 +1116,7 @@ def _render_cover(
             _draw_text_lines(draw, deck_lines, margin_x, h_end + 28, 36, deck_font, (*LIGHT_SECONDARY, 246))
 
         canvas = _draw_progress_footer(
-            canvas, 1, total_slides, handle, "VISUAL BRIEF", accent, (*LIGHT_MUTED, 235),
+            canvas, 1, total_slides, handle, "RUMOR WATCH" if is_rumor else "VISUAL BRIEF", accent, (*LIGHT_MUTED, 235),
             (255, 255, 255, 42), (16, 20, 26, 226), (*LIGHT_PRIMARY, 252), (*accent, 190),
             progress_style=spec["progress_style"],
         )
@@ -1160,6 +1168,12 @@ def _render_cover(
 
         kicker_y = 632 if layout == "split_top_photo" else 666
         canvas = _draw_kicker(canvas, topic_tag, margin_x + (18 if layout == "split_top_photo" else 0), kicker_y, spec, palette)
+        if is_rumor:
+            canvas, _ = _draw_pill(
+                canvas, "UNCONFIRMED RUMOR", CARD_WIDTH - 68, kicker_y,
+                bg_fill=(232, 146, 28, 245), text_fill=(18, 14, 10, 255),
+                align_right=True, font_size=13, pad_x=13, height=30,
+            )
         draw = ImageDraw.Draw(canvas)
         h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 56, 48, font_weight=spec["headline_font"], max_lines=4)
         h_step = int(h_font.size * 1.14)
@@ -1170,10 +1184,16 @@ def _render_cover(
             deck_lines = _wrap_text(draw, deck, deck_font, content_w, max_lines=3)
             avail = max(1, (1195 - (h_end + 35)) // 37)
             _draw_text_lines(draw, deck_lines[:avail], margin_x, h_end + 35, 37, deck_font, secondary_fill)
-        footer_label = "NOIR EDITION" if layout == "duotone_frame" else "DAILY BRIEF"
+        footer_label = "RUMOR WATCH" if is_rumor else ("NOIR EDITION" if layout == "duotone_frame" else "DAILY BRIEF")
     else:
         # split_bottom_photo, editorial_sidebar, riso_zine -> headline-first above framed photo
         canvas = _draw_kicker(canvas, topic_tag, margin_x, 122, spec, palette)
+        if is_rumor:
+            canvas, _ = _draw_pill(
+                canvas, "UNCONFIRMED RUMOR", CARD_WIDTH - 68, 122,
+                bg_fill=(232, 146, 28, 245), text_fill=(18, 14, 10, 255),
+                align_right=True, font_size=13, pad_x=13, height=30,
+            )
         draw = ImageDraw.Draw(canvas)
         h_lines, h_font = _fit_headline_lines(draw, headline, content_w, 56, 48, font_weight=spec["headline_font"], max_lines=4)
         h_step = int(h_font.size * 1.13)
@@ -1203,7 +1223,7 @@ def _render_cover(
             mask = Image.new("L", plate.size, 0)
             ImageDraw.Draw(mask).rounded_rectangle((0, 0, *plate.size), radius=16, fill=255)
             canvas.paste(plate, (photo_box[0], photo_box[1]), mask)
-        footer_label = "PRINT ZINE" if layout == "riso_zine" else ("EDITION" if layout == "editorial_sidebar" else "DISPATCH")
+        footer_label = "RUMOR WATCH" if is_rumor else ("PRINT ZINE" if layout == "riso_zine" else ("EDITION" if layout == "editorial_sidebar" else "DISPATCH"))
 
     canvas = _draw_progress_footer(
         canvas, 1, total_slides, handle, footer_label, accent, muted_fill,
@@ -1589,11 +1609,17 @@ def _render_closing_slide(
     draw.line((inner_x, divider_y, CARD_WIDTH - 68 - 36, divider_y), fill=style["divider"], width=1)
 
     domain = _strip_invisible(topic.get("allowed_host") or "official release").lower()
+    is_rumor = bool(topic.get("is_rumor"))
     draw.text((inner_x, divider_y + 22), f"FULL ARTICLE & DISCUSSION ON THREADS  ·  {handle.upper()}", font=_load_font("semibold", 20), fill=style["primary"])
-    draw.text((inner_x, divider_y + 56), f"Tap link in bio for the verified {domain} release.", font=_load_font("regular", 19), fill=style["muted"])
+    sub_cta = (
+        f"Unconfirmed rumor via {domain} — wait for official confirmation."
+        if is_rumor
+        else f"Tap link in bio for the verified {domain} release."
+    )
+    draw.text((inner_x, divider_y + 56), sub_cta, font=_load_font("regular", 19), fill=style["muted"])
 
     canvas = _draw_progress_footer(
-        canvas, total_slides, total_slides, handle, "END OF BRIEF", accent, style["muted"], style["divider"],
+        canvas, total_slides, total_slides, handle, "RUMOR WATCH" if is_rumor else "END OF BRIEF", accent, style["muted"], style["divider"],
         style["badge_bg"], style["badge_text"], style["badge_outline"], margin_x=margin_x,
         progress_style=spec["progress_style"],
     )

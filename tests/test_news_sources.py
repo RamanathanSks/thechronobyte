@@ -383,6 +383,34 @@ class SourceChecks(unittest.TestCase):
             raw, final_url, mime = news.fetch_image_bytes("https://www.notion.com/hero.jpg", "test")
         self.assertEqual((raw, final_url, mime), (b"JPEGDATA", "https://images.ctfassets.net/real.jpg", "image/jpeg"))
 
+    def test_expanded_gaming_mobile_tech_rumor_feeds_and_google_trends(self):
+        sources = {source for source, _, _ in news.NEWS_FEEDS}
+        for name in ("IGN", "Eurogamer", "PC Gamer", "Polygon", "9to5Mac", "9to5Google",
+                     "Android Authority", "Android Police", "MacRumors", "The Verge",
+                     "TechCrunch", "Tom's Hardware", "XDA Developers", "NotebookCheck"):
+            self.assertIn(name, sources)
+        self.assertTrue(news.is_rumor_story("Galaxy S27 Ultra camera specs leaked ahead of launch", "NotebookCheck"))
+        self.assertTrue(news.is_rumor_story("iPhone 18 Pro could gain under-display Face ID", "MacRumors"))
+        self.assertFalse(news.is_rumor_story("PlayStation announces official PS5 system update", "PlayStation"))
+        self.assertTrue(bool(news.DEALS_SPAM_PATTERN.search("Best Black Friday deals: save $50 on earbuds")))
+
+        trends_xml = b"<rss><channel><item><title>GTA VI</title></item><item><title>Galaxy S27</title></item></channel></rss>"
+        with patch.object(news.requests, "get", return_value=self.response(body=trends_xml)):
+            trends = news.fetch_google_trends(("US",), "test")
+        self.assertEqual(trends, ["GTA VI", "Galaxy S27"])
+
+    def test_verify_article_skips_author_bio_containers_inside_article(self):
+        html = self.page(
+            body=(
+                f"{self.body}</p>"
+                '<div class="author-bio"><p>I\'ve been writing about Android and Samsung phones since 2011 across major tech events.</p></div>'
+                '<p>The second real technical paragraph explains concrete power efficiency improvements for users.'
+            )
+        )
+        result = self.verify(html)
+        self.assertEqual(len(result["paragraphs"]), 2)
+        self.assertFalse(any("writing about Android" in p for p in result["paragraphs"]))
+
 
 if __name__ == "__main__":
     unittest.main()

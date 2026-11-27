@@ -53,6 +53,26 @@ NEWS_FEEDS = (
     ("Notion", "https://www.notion.com/blog", "www.notion.com"),
     ("JPMorganChase", "https://www.jpmorganchase.com/sitemap.xml", "www.jpmorganchase.com"),
     ("Comcast", "https://corporate.comcast.com/press", "corporate.comcast.com"),
+    # Gaming news, launches & leaks.
+    ("IGN", "https://www.ign.com/rss/articles/feed", "www.ign.com"),
+    ("Eurogamer", "https://www.eurogamer.net/feed/news", "www.eurogamer.net"),
+    ("PC Gamer", "https://www.pcgamer.com/rss/", "www.pcgamer.com"),
+    ("Polygon", "https://www.polygon.com/rss/index.xml", "www.polygon.com"),
+    # Latest mobile news, flagships & leaks/rumors.
+    ("9to5Mac", "https://9to5mac.com/feed/", "9to5mac.com"),
+    ("9to5Google", "https://9to5google.com/feed/", "9to5google.com"),
+    ("Android Authority", "https://www.androidauthority.com/feed/", "www.androidauthority.com"),
+    ("Android Police", "https://www.androidpolice.com/feed/", "www.androidpolice.com"),
+    ("MacRumors", "https://feeds.macrumors.com/MacRumors-All", "www.macrumors.com"),
+    # Latest tech news, upcoming hardware, gadgets & rumors.
+    ("The Verge", "https://www.theverge.com/rss/index.xml", "www.theverge.com"),
+    ("TechCrunch", "https://techcrunch.com/feed/", "techcrunch.com"),
+    ("Tom's Hardware", "https://www.tomshardware.com/feeds.xml", "www.tomshardware.com"),
+    ("XDA Developers", "https://www.xda-developers.com/feed/", "www.xda-developers.com"),
+    ("Engadget", "https://www.engadget.com/rss.xml", "www.engadget.com"),
+    ("Gizmodo", "https://gizmodo.com/feed", "gizmodo.com"),
+    ("TechSpot", "https://www.techspot.com/backend.xml", "www.techspot.com"),
+    ("NotebookCheck", "https://www.notebookcheck.net/News.152.100.html", "www.notebookcheck.net"),
 )
 SOURCE_CATEGORIES = {
     "Apple": "Tech Industry", "Meta": "Tech Industry", "Microsoft": "Tech Industry",
@@ -64,8 +84,17 @@ SOURCE_CATEGORIES = {
     "Salesforce": "Productivity", "Stripe": "Financial Technology", "Mozilla": "Developer Tools",
     "IBM": "Tech Industry", "Figma": "Design Tools", "Anthropic": "Claude",
     "Notion": "Productivity", "JPMorganChase": "Financial Technology", "Comcast": "Connectivity",
+    "IGN": "Video Games", "Eurogamer": "Video Games", "PC Gamer": "Video Games", "Polygon": "Video Games",
+    "9to5Mac": "Mobile Phones", "9to5Google": "Mobile Phones",
+    "Android Authority": "Mobile Phones", "Android Police": "Mobile Phones", "MacRumors": "Mobile Phones",
+    "The Verge": "Tech Industry", "TechCrunch": "Tech Industry",
+    "Tom's Hardware": "Computer Hardware", "XDA Developers": "Mobile Phones",
+    "Engadget": "Tech Industry", "Gizmodo": "Tech Industry",
+    "TechSpot": "Computer Hardware", "NotebookCheck": "Upcoming Tech",
 }
-REQUIRES_TECH_MATCH = frozenset({"Amazon", "Comcast", "IBM"})
+REQUIRES_TECH_MATCH = frozenset({
+    "Amazon", "Comcast", "IBM", "The Verge", "TechCrunch", "Engadget", "Gizmodo", "Polygon", "IGN",
+})
 NEWSROOM_PATHS = {
     "Figma": r"^/blog/[^/]+/?$",
     "Anthropic": r"^/news/[^/]+/?$",
@@ -74,15 +103,35 @@ NEWSROOM_PATHS = {
     "Comcast": r"^/(?:press/releases|stories|news-information/news-feed)/.+$",
 }
 MAX_NEWSROOM_ARTICLES = 6
-# Observed official migration: DeepMind articles redirect to Google's own blog.
-# This is an explicit publisher exception, not permission to follow arbitrary hosts.
-PUBLISHER_HOSTS = {"deepmind.google": ("deepmind.google", "blog.google")}
+# Explicit publisher host exceptions (official feed/blog host pairs).
+PUBLISHER_HOSTS = {
+    "deepmind.google": ("deepmind.google", "blog.google"),
+    "www.macrumors.com": ("www.macrumors.com", "feeds.macrumors.com"),
+}
 VISIBLE_DATE = re.compile(
     r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
     r"Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}\b"
 )
 PRICE_PATTERN = re.compile(r"\b(pric(?:e|es|ing)|msrp|costs?|discounts?|retail\s+offers?)\b", re.I)
-RUMOR_PATTERN = re.compile(r"\b(rumou?rs?|unconfirmed|leaked?|speculation|reportedly)\b", re.I)
+RUMOR_PATTERN = re.compile(
+    r"\b(rumou?rs?|rumou?red|unconfirmed|leaks?|leaked|leaker|tipster|insiders?|"
+    r"speculation|reportedly|allegedly|purportedly|said to|tipped to|cad renders?|"
+    r"geekbench leak|benchmark leak|early render|supply chain report)\b",
+    re.I,
+)
+UPCOMING_PATTERN = re.compile(
+    r"\b(upcoming|next[- ]gen|next generation|teased|teaser|prototype|roadmap|"
+    r"coming soon|launching soon|expected in 202\d|first look|hands[- ]on|spotted on geekbench)\b",
+    re.I,
+)
+DEALS_SPAM_PATTERN = re.compile(
+    r"\b(black friday|cyber monday|prime day|best deals?|on sale|gift guide|buying guide|"
+    r"save \$?\d+|up to \d+%\s*off|\d+%\s*off|lowest price|price drop|coupon|promo code|"
+    r"wordle|connections hints|strands hints|mini crossword|merino wool|best .* to buy)\b",
+    re.I,
+)
+RUMOR_SOFT_SOURCES = frozenset({"MacRumors"})
+GOOGLE_TRENDS_RSS = "https://trends.google.com/trending/rss?geo={geo}"
 AMOUNT_PATTERN = re.compile(r"(?:US\$|AU\$|CA\$|USD|INR|EUR|GBP|AUD|CAD|JPY|Rs\.?|[₹$€£¥])\s*\d[\d,.]*", re.I)
 ATOM = "{http://www.w3.org/2005/Atom}"
 MAX_BYTES = 4_000_000
@@ -103,6 +152,17 @@ _NON_PHOTO_IMAGE = re.compile(
     r"(?:favicon|apple-touch-icon|/(?:icons?|avatars?|logos?|badges?|sprites?)/|"
     r"(?:^|[/_-])(?:logo|avatar|icon|badge|sprite|pixel|spacer|placeholder)[._-]|"
     r"/_next/image|\.(?:svg|ico|gif)(?:$|[?#]))",
+    re.I,
+)
+_SKIP_CONTAINER_HINT = re.compile(
+    r"(?:author|byline|bio[-_]|[-_]bio\b|related[-_]?(?:posts?|articles?)|"
+    r"newsletter|subscribe|affiliate|disclaimer|comment[-_]?list|comments|sidebar|breadcrumb|social[-_]?share)",
+    re.I,
+)
+_BOILERPLATE_OR_BIO = re.compile(
+    r"cookies|privacy policy|sign up|subscribe|all rights reserved|affiliate links?|earn a commission|"
+    r"i['’]ve been writing|i have been writing|throughout my (?:writing )?career|"
+    r"gives me deep insight|when (?:he|she|they)['’]?s? not writing|follow (?:him|her|them|me) on",
     re.I,
 )
 
@@ -399,6 +459,7 @@ class ArticleEvidence(HTMLParser):
         self.inline_css_parts: list[str] = []
         self.svg_colors: list[str] = []
         self.scope = self.skip = 0
+        self.skip_tag_stack: list[str] = []
         self.in_style = False
         self.capture = None
         self.parts = []
@@ -410,8 +471,12 @@ class ArticleEvidence(HTMLParser):
             self.json_parts = []
         if tag == "style":
             self.in_style = True
+        hint_blob = f"{attrs.get('class', '')} {attrs.get('id', '')}"
         if tag in {"nav", "footer", "aside", "script", "style", "form", "noscript"}:
             self.skip += 1
+        elif tag in {"div", "section", "p", "figure", "header"} and _SKIP_CONTAINER_HINT.search(hint_blob):
+            self.skip += 1
+            self.skip_tag_stack.append(tag)
         if tag in {"article", "main"}:
             self.scope += 1
         inline_style = attrs.get("style", "")
@@ -482,7 +547,7 @@ class ArticleEvidence(HTMLParser):
             if text:
                 self.headings.append(text)
                 self.h1_headings.append(text)
-        elif len(text) >= 50 and not re.search(r"cookies|privacy policy|sign up|subscribe|all rights reserved", text, re.I):
+        elif len(text) >= 50 and not _BOILERPLATE_OR_BIO.search(text):
             self.paragraphs.append(text)
         self.capture = None
         self.parts = []
@@ -497,6 +562,9 @@ class ArticleEvidence(HTMLParser):
                 pass
             self.json_parts = None
         if tag in {"nav", "footer", "aside", "script", "style", "form", "noscript"}:
+            self.skip = max(0, self.skip - 1)
+        elif self.skip_tag_stack and self.skip_tag_stack[-1] == tag:
+            self.skip_tag_stack.pop()
             self.skip = max(0, self.skip - 1)
         if tag in {"article", "main"}:
             self.scope = max(0, self.scope - 1)
@@ -739,6 +807,45 @@ def collect_article_images(parser: ArticleEvidence, base_url: str, max_urls: int
     return resolved
 
 
+def is_rumor_story(title: str, source: str = "", paragraphs: list[str] | None = None) -> bool:
+    """Detect whether a story is an unconfirmed leak/rumor so it is always labeled explicitly."""
+    if RUMOR_PATTERN.search(title or ""):
+        return True
+    if source in RUMOR_SOFT_SOURCES and re.search(
+        r"\b(could|may|might|expected|reported|analyst|kuo|gurman|ross young|supply chain)\b",
+        title or "",
+        re.I,
+    ):
+        return True
+    lead = " ".join((paragraphs or [])[:2])
+    return bool(lead and RUMOR_PATTERN.search(lead))
+
+
+def fetch_google_trends(geos: tuple[str, ...] = ("US", "IN"), contact: str = "local preview") -> list[str]:
+    """Best-effort fetch of live Google Trends daily RSS topics (free, zero API keys)."""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for geo in geos:
+        url = GOOGLE_TRENDS_RSS.format(geo=geo)
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": f"DailyTechNewsBot/1.0 ({contact})"},
+                timeout=(3, 5),
+            )
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            for item in root.findall("./channel/item"):
+                raw = (item.findtext("title") or "").strip()
+                norm = " ".join(raw.split())
+                if norm and norm.lower() not in seen:
+                    seen.add(norm.lower())
+                    terms.append(norm)
+        except (requests.RequestException, ET.ParseError, ValueError):
+            continue
+    return terms
+
+
 def _words(text: str) -> list[str]:
     return re.findall(r"\w+", unicodedata.normalize("NFKC", unescape(text)).casefold())
 
@@ -821,11 +928,13 @@ def verify_article(story: dict, contact: str, now: datetime, max_age_hours: int,
     paragraphs = labeled_prices + [p for p in paragraphs if p not in priced_quotes]
     image_urls = collect_article_images(parser, final_url)
     source_theme = extract_source_theme(parser, final_url, story["allowed_host"])
+    rumor_flag = is_rumor_story(story["text"], story.get("source", ""), paragraphs)
     return {
         "source_url": final_url, "published": published,
         "paragraphs": paragraphs[:12], "summary": "", "content_blocks": [],
         "image_urls": image_urls,
         "source_theme": source_theme,
+        "is_rumor": rumor_flag,
         "price_evidence": prices,
         "verification": {
             "checked_at": datetime.now(timezone.utc).isoformat(), "article_url": final_url,

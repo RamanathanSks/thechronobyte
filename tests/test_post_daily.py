@@ -937,6 +937,36 @@ class DailyThreadsPostTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "2207051"):
                 bot.post_to_instagram("https://cdn.example.com/card.jpg", "Unpublished caption")
 
+    def test_rumor_stories_are_explicitly_labeled_and_trends_upgrade_tags_and_hashtags(self):
+        rumor_topic = {
+            **self.topic,
+            "source": "MacRumors",
+            "allowed_host": "www.macrumors.com",
+            "text": "iPhone 18 Pro leaked with variable aperture camera lens",
+            "paragraphs": [
+                "A new supply chain leak claims Apple is testing a variable aperture main lens for the upcoming iPhone 18 Pro.",
+                "Mass production of the new camera modules is reportedly scheduled for late next year.",
+            ],
+            "is_rumor": True,
+            "matched_trends": ["iPhone 18 Pro"],
+            "topic_tag": "iPhone 18 Pro",
+        }
+        posts = bot.generate_thread(rumor_topic)
+        self.assertIn("RUMOR", posts[0].upper())
+        self.assertIn("▸", posts[0])
+        self.assertTrue(any("?" in p for p in posts))
+
+        caption = bot.generate_instagram_caption(rumor_topic)
+        self.assertIn("RUMOR", caption.splitlines()[0].upper())
+        self.assertIn("unconfirmed rumor", caption.lower())
+        self.assertIn("#iPhone18Pro", caption)
+        self.assertIn("#TechRumors", caption)
+        self.assertIn("#TheChronoByte", caption)
+
+        tag, matched = bot._resolve_trending_topic_tag(rumor_topic, ["GTA VI", "iPhone 18 Pro"])
+        self.assertEqual(tag, "iPhone 18 Pro")
+        self.assertEqual(matched, ["iPhone 18 Pro"])
+
 
 if __name__ == "__main__":
     unittest.main()
