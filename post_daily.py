@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import io
 import logging
 import os
 import re
@@ -16,13 +17,14 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from news_sources import (
     NEWS_FEEDS, SOURCE_CATEGORIES, PRICE_PATTERN, RUMOR_PATTERN,
     NEWSROOM_PATHS, REQUIRES_TECH_MATCH,
     fetch_source, feed_items, parse_date, verify_article, load_newsroom, approved_url,
+    approved_image_url, fetch_image_bytes,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -72,7 +74,10 @@ MAX_POST_LENGTH = 500  # Threads text limit (checked conservatively in UTF-8 byt
 MAX_IG_CAPTION_LENGTH = 2200  # Instagram Graph API caption limit.
 IG_BODY_TARGET_LENGTH = 1750  # Rich multi-paragraph mobile caption before CTA + hashtags.
 MAX_ARTICLE_BYTES = 750_000
-MAX_CAROUSEL_SLIDES = 6
+MAX_CAROUSEL_SLIDES = 5
+MAX_SOURCE_IMAGES = 3
+MEDIA_CONTENT_TAG = "{http://search.yahoo.com/mrss/}content"
+MEDIA_THUMBNAIL_TAG = "{http://search.yahoo.com/mrss/}thumbnail"
 HTTP_TIMEOUT = (5, 20)  # Connect and read timeouts, in seconds.
 URL_PATTERN = re.compile(r"https?://\S+|\b(?:[\w-]+\.)+[a-z]{2,}(?:/\S*)?", re.I)
 USER_ID_PATTERN = re.compile(r"^(?:me|\d{1,30})$")
@@ -120,8 +125,9 @@ FOLLOWUP_INTROS = (
     "Closer look at the details ↓",
 )
 IG_HOOK_TEMPLATES = (
-    "{emoji} According to {source} ({date_label}) ↓",
-    "{emoji} From the original {source} announcement ({date_label}) ↓",
+    "{emoji} {source} ({date_label}) — here is what changed ↓",
+    "{emoji} Inside the new {source} announcement ({date_label}) ↓",
+    "{emoji} Verified from {source} ({date_label}) — swipe the breakdown ↓",
 )
 IG_THREAD_CTAS = (
     "🔗 Clickable source link & full discussion on @thechronobyte Threads (link in bio).",
@@ -256,6 +262,103 @@ def _extract_plain_text(raw_html: str) -> str:
     parser.feed(raw_html)
     parser.close()
     return _clean_text(unescape(parser.text()))
+
+
+def _extract_feed_image_urls(item: ET.Element, base_url: str, *html_fragments: str) -> list[str]:
+    """Collect candidate image URLs from RSS/Atom media elements and HTML fragments."""
+    candidates: list[str] = []
+    for tag in (MEDIA_CONTENT_TAG, MEDIA_THUMBNAIL_TAG, "enclosure"):
+        for node in item.findall(tag):
+            media_type = (node.get("type") or "").lower()
+            medium = (node.get("medium") or "").lower()
+            if tag == "enclosure" and media_type and not media_type.startswith("image/"):
+                continue
+            if tag == MEDIA_CONTENT_TAG and medium and medium != "image" and not media_type.startswith("image/"):
+                continue
+            url = (node.get("url") or "").strip()
+            if url:
+                candidates.append(urljoin(base_url, url))
+    for frag in html_fragments:
+        if frag:
+            for match in re.finditer(r'<img\b[^>]+?\bsrc\s*=\s*["\']([^"\']+)["\']', frag, re.I):
+                candidates.append(urljoin(base_url, match.group(1).strip()))
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for url in candidates:
+        if url not in seen and approved_image_url(url):
+            seen.add(url)
+            resolved.append(url)
+    return resolved
+
+
+def _image_fingerprint(img) -> str:
+    """Compute a fast perceptual signature so identical hero/thumbnail images are deduplicated."""
+    small = img.convert("L").resize((8, 8))
+    pixels = small.tobytes()
+    avg = sum(pixels) / max(1, len(pixels))
+    bits = "".join("1" if p >= avg else "0" for p in pixels)
+    return f"{int(bits, 2):016x}"
+
+
+def _prepare_source_images(topic: dict, contact: str = "local preview", max_images: int = MAX_SOURCE_IMAGES) -> list[dict]:
+    """Best-effort download, EXIF-fix, size check and dedup of verified official article photos."""
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    preloaded = topic.get("images")
+    if preloaded:
+        return list(preloaded)[:max_images]
+
+    urls = [
+        url
+        for url in dict.fromkeys(list(topic.get("image_urls") or []) + list(topic.get("feed_image_urls") or []))
+        if approved_image_url(url)
+    ]
+    if not urls:
+        LOGGER.info("[2/6 Media] No verified source image URLs embedded; using editorial typography art.")
+        return []
+
+    started = time.monotonic()
+    prepared: list[dict] = []
+    seen_fps: set[str] = set()
+    for url in urls[:8]:
+        try:
+            raw_bytes, final_url, _ = fetch_image_bytes(url, contact)
+            with Image.open(io.BytesIO(raw_bytes)) as opened:
+                img = ImageOps.exif_transpose(opened)
+                img.load()
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA" if "transparency" in img.info else "RGB")
+            w, h = img.size
+            aspect = w / max(1, h)
+            if w < 420 or h < 220 or aspect > 4.5 or aspect < 0.25:
+                LOGGER.info("[2/6 Media] Skipped unsuitable image %dx%d (%.2f aspect): %s", w, h, aspect, final_url)
+                continue
+            fp = _image_fingerprint(img)
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+            host = urlsplit(final_url).hostname or topic.get("allowed_host", "")
+            prepared.append({
+                "image": img,
+                "url": final_url,
+                "source_host": host,
+                "credit": topic.get("source", host),
+            })
+            if len(prepared) >= max_images:
+                break
+        except (requests.RequestException, ValueError, OSError, UnidentifiedImageError) as error:
+            LOGGER.info("[2/6 Media] Skipped source image candidate (%s): %s", type(error).__name__, url)
+            continue
+
+    dims = [f"{item['image'].width}x{item['image'].height}" for item in prepared]
+    LOGGER.info(
+        "[2/6 Media] Downloaded %d/%d verified source image(s) (%s, %.2fs).",
+        len(prepared),
+        len(urls),
+        ", ".join(dims) if dims else "none usable",
+        time.monotonic() - started,
+    )
+    return prepared
 
 
 def _post_weight(text: str) -> int:
@@ -497,6 +600,7 @@ def get_topic_of_the_day(now: datetime | None = None) -> dict | None:
                 "summary": summary,
                 "paragraphs": [],
                 "content_blocks": rss_blocks,
+                "feed_image_urls": _extract_feed_image_urls(item, link, encoded_html, desc_html),
                 "source_url": link,
                 "published": published.astimezone(timezone.utc),
                 "date_kind": item.get("date_kind", "published"),
@@ -1420,9 +1524,17 @@ def _fetch_instagram_permalink(media_id: str) -> str | None:
         return None
 
 
-def publish_instagram_card(topic: dict, caption: str) -> str:
-    """Render multi-slide 1080x1350 carousel cards, upload to HTTPS host, and publish to Instagram."""
+def _contact_label() -> str:
+    repository = os.getenv("GITHUB_REPOSITORY", "").strip()
+    return f"https://github.com/{repository}" if repository else "local preview"
+
+
+def publish_instagram_card(topic: dict, caption: str, source_images: list[dict] | None = None) -> str:
+    """Render dynamic multi-slide 1080x1350 carousel cards, upload to HTTPS host, and publish to Instagram."""
     from card_generator import render_news_card, render_news_carousel
+
+    if source_images is None:
+        source_images = _prepare_source_images(topic, contact=_contact_label())
 
     slug = hashlib.sha256(topic["source_url"].encode("utf-8")).hexdigest()[:8]
     stem = f"{topic['published']:%Y%m%d}-{slug}"
@@ -1430,7 +1542,7 @@ def publish_instagram_card(topic: dict, caption: str) -> str:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         if explicit_single_url:
-            card_path = render_news_card(topic, Path(tmpdir) / f"{stem}.jpg")
+            card_path = render_news_card(topic, Path(tmpdir) / f"{stem}.jpg", source_images=source_images)
             image_urls = [_resolve_card_image_url(card_path)]
         else:
             slide_paths = render_news_carousel(
@@ -1439,6 +1551,7 @@ def publish_instagram_card(topic: dict, caption: str) -> str:
                 stem=stem,
                 max_slides=MAX_CAROUSEL_SLIDES,
                 discussion_prompt=topic.get("discussion_prompt") or _pick_discussion_question(topic),
+                source_images=source_images,
             )
             image_urls = [_resolve_card_image_url(p) for p in slide_paths]
 
@@ -1533,6 +1646,7 @@ def _write_github_step_summary(
                 f"- **Source checked (UTC):** `{evidence['checked_at']}`",
                 f"- **Page SHA256:** `{evidence['sha256']}`",
                 f"- **Date basis:** {evidence['publication_date_basis']}",
+                f"- **Source images downloaded:** `{topic.get('downloaded_image_count', 0)}`",
                 "- **Check scope:** Original publisher, matching headline, freshness and source wording. Publisher claims are attributed, not independently proven.",
             ])
         for price in topic.get("price_evidence", []):
@@ -1581,6 +1695,8 @@ def main(argv: list[str] | None = None) -> int:
             if topic is None:
                 LOGGER.info("Pipeline completed in %.2fs (no story to save).", time.monotonic() - started)
                 return 0
+            source_images = _prepare_source_images(topic, contact=_contact_label())
+            topic["downloaded_image_count"] = len(source_images)
             target = Path(args[1])
             slides = render_news_carousel(
                 topic,
@@ -1588,6 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
                 stem=target.stem,
                 max_slides=MAX_CAROUSEL_SLIDES,
                 discussion_prompt=topic.get("discussion_prompt") or _pick_discussion_question(topic),
+                source_images=source_images,
             )
             if slides and slides[0] != target:
                 slides[0].replace(target)
@@ -1632,6 +1749,8 @@ def main(argv: list[str] | None = None) -> int:
         posts = generate_thread(topic) if enable_threads == "true" else []
         topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
         ig_caption = generate_instagram_caption(topic) if enable_instagram == "true" else ""
+        source_images = _prepare_source_images(topic, contact=_contact_label()) if enable_instagram == "true" else []
+        topic["downloaded_image_count"] = len(source_images)
 
         if dry_run == "true":
             slides: list[Path] = []
@@ -1655,10 +1774,12 @@ def main(argv: list[str] | None = None) -> int:
                         stem=f"{topic['published']:%Y%m%d}-{slug}",
                         max_slides=MAX_CAROUSEL_SLIDES,
                         discussion_prompt=topic.get("discussion_prompt") or _pick_discussion_question(topic),
+                        source_images=source_images,
                     )
                 LOGGER.info(
-                    "DRY RUN: no Instagram request made (%d carousel slide(s) ready). Caption preview (%s chars):\n%s",
+                    "DRY RUN: no Instagram request made (%d carousel slide(s), %d source photo(s) ready). Caption preview (%s chars):\n%s",
                     len(slides),
+                    len(source_images),
                     len(ig_caption),
                     ig_caption,
                 )
@@ -1695,7 +1816,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if enable_instagram == "true":
             try:
-                ig_id = publish_instagram_card(topic, ig_caption)
+                ig_id = publish_instagram_card(topic, ig_caption, source_images=source_images)
                 ig_status = f"Published (media ID `{ig_id}`)"
                 LOGGER.info("Posted successfully to Instagram (media ID: %s).", ig_id)
             except (requests.RequestException, ValueError) as error:

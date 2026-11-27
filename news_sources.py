@@ -5,6 +5,7 @@ publisher's claims are true. No search snippets, rumors or model output qualify.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -84,6 +85,13 @@ RUMOR_PATTERN = re.compile(r"\b(rumou?rs?|unconfirmed|leaked?|speculation|report
 AMOUNT_PATTERN = re.compile(r"(?:US\$|AU\$|CA\$|USD|INR|EUR|GBP|AUD|CAD|JPY|Rs\.?|[₹$€£¥])\s*\d[\d,.]*", re.I)
 ATOM = "{http://www.w3.org/2005/Atom}"
 MAX_BYTES = 4_000_000
+MAX_IMAGE_BYTES = 8_000_000
+_NON_PHOTO_IMAGE = re.compile(
+    r"(?:favicon|apple-touch-icon|/(?:icons?|avatars?|logos?|badges?|sprites?)/|"
+    r"(?:^|[/_-])(?:logo|avatar|icon|badge|sprite|pixel|spacer|placeholder)[._-]|"
+    r"/_next/image|\.(?:svg|ico|gif)(?:$|[?#]))",
+    re.I,
+)
 
 
 def approved_url(url: str, host: str) -> bool:
@@ -97,6 +105,72 @@ def approved_url(url: str, host: str) -> bool:
         )
     except ValueError:
         return False
+
+
+def approved_image_url(url: str) -> bool:
+    """Validate that an image URL is a clean public HTTPS asset (never private/local)."""
+    if not url or any(ord(c) < 33 or c == "\\" for c in url):
+        return False
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or not host
+        or "." not in host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+        or host in {"localhost", "localhost.localdomain"}
+        or host.endswith((".local", ".internal", ".localhost", ".localdomain", ".arpa"))
+    ):
+        return False
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+        if not ip.is_global:
+            return False
+    except ValueError:
+        pass
+    return not _NON_PHOTO_IMAGE.search(url)
+
+
+def fetch_image_bytes(url: str, contact: str) -> tuple[bytes, str, str]:
+    """Download an official source image cleanly with public-HTTPS redirect and size caps."""
+    for _ in range(4):
+        if not approved_image_url(url):
+            raise ValueError("Source image URL is not an approved public HTTPS asset.")
+        with requests.get(
+            url,
+            headers={
+                "User-Agent": f"DailyTechNewsBot/1.0 ({contact})",
+                "Accept": "image/webp,image/png,image/jpeg,image/*;q=0.8",
+            },
+            timeout=(4, 10),
+            allow_redirects=False,
+            stream=True,
+        ) as response:
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("Missing image redirect target.")
+                url = urljoin(url, location)
+                continue
+            response.raise_for_status()
+            if response.status_code != 200:
+                raise ValueError("Expected a complete image response.")
+            content_type = response.headers.get("Content-Type", "").lower()
+            if content_type and (not content_type.startswith("image/") or "svg" in content_type):
+                raise ValueError("Source asset is not a raster image.")
+            chunks, size = [], 0
+            for chunk in response.iter_content(65536):
+                size += len(chunk)
+                if size > MAX_IMAGE_BYTES:
+                    raise ValueError("Source image exceeds the download limit.")
+                chunks.append(chunk)
+            return b"".join(chunks), url, content_type
+    raise ValueError("Too many image redirects.")
 
 
 def fetch_source(url: str, host: str, contact: str) -> tuple[bytes, str, str]:
@@ -268,13 +342,46 @@ def load_newsroom(source: str, content: bytes, url: str, host: str, contact: str
     return items, cache
 
 
+def _parse_srcset_best(srcset: str) -> str:
+    """Return the highest-resolution candidate URL from an HTML srcset string."""
+    best_url = ""
+    best_score = -1.0
+    for part in srcset.split(","):
+        tokens = part.strip().split()
+        if not tokens:
+            continue
+        candidate = tokens[0]
+        score = 1.0
+        if len(tokens) > 1:
+            desc = tokens[1].lower()
+            try:
+                if desc.endswith("w"):
+                    score = float(desc[:-1])
+                elif desc.endswith("x"):
+                    score = float(desc[:-1]) * 1000.0
+            except ValueError:
+                pass
+        if score > best_score:
+            best_score = score
+            best_url = candidate
+    return best_url
+
+
+def _parse_dim(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.match(r"^\s*(\d+)", str(value))
+    return int(match.group(1)) if match else None
+
+
 class ArticleEvidence(HTMLParser):
-    """Read page headings, publication metadata and paragraphs inside main/article."""
+    """Read page headings, publication metadata, paragraphs and media inside main/article."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.headings, self.paragraphs, self.dates, self.canonicals = [], [], [], []
         self.h1_headings = []
+        self.meta_images, self.schema_images, self.article_images = [], [], []
         self.scope = self.skip = 0
         self.capture = None
         self.parts = []
@@ -295,11 +402,54 @@ class ArticleEvidence(HTMLParser):
                 self.headings.append(value)
             if key in {"article:published_time", "datepublished", "date", "pubdate"}:
                 self.dates.append(value)
+            if key in {"og:image:secure_url", "og:image", "twitter:image", "twitter:image:src"} and value:
+                self.meta_images.append((key, value.strip()))
         if tag == "link" and attrs.get("rel") == "canonical":
             self.canonicals.append(attrs.get("href", ""))
+        if not self.skip and self.scope and tag in {"img", "source"}:
+            if tag == "source":
+                media_type = (attrs.get("type") or "").lower()
+                if media_type and not media_type.startswith("image/"):
+                    return
+                candidate = _parse_srcset_best(attrs.get("srcset", ""))
+                alt, w, h = "", None, None
+            else:
+                srcset_best = _parse_srcset_best(attrs.get("srcset", ""))
+                candidate = (
+                    attrs.get("src")
+                    or attrs.get("data-src")
+                    or attrs.get("data-lazy-src")
+                    or srcset_best
+                    or ""
+                ).strip()
+                if candidate.startswith("data:") and srcset_best:
+                    candidate = srcset_best
+                alt = (attrs.get("alt") or "").strip()
+                w = _parse_dim(attrs.get("width"))
+                h = _parse_dim(attrs.get("height"))
+            if candidate and not candidate.startswith("data:"):
+                if (w is not None and w < 320) or (h is not None and h < 200):
+                    return
+                if not _NON_PHOTO_IMAGE.search(alt):
+                    self.article_images.append(candidate)
+        if self.capture == "h1" and tag in {"p", "h1", "h2", "h3", "div", "section", "article"}:
+            self._flush_capture()
         if not self.skip and self.capture is None:
             if tag == "h1" or (tag == "p" and self.scope):
                 self.capture, self.parts = tag, []
+
+    def _flush_capture(self) -> None:
+        if not self.capture:
+            return
+        text = " ".join("".join(self.parts).split())
+        if self.capture == "h1":
+            if text:
+                self.headings.append(text)
+                self.h1_headings.append(text)
+        elif len(text) >= 50 and not re.search(r"cookies|privacy policy|sign up|subscribe|all rights reserved", text, re.I):
+            self.paragraphs.append(text)
+        self.capture = None
+        self.parts = []
 
     def handle_endtag(self, tag):
         if tag == "script" and self.json_parts is not None:
@@ -313,19 +463,26 @@ class ArticleEvidence(HTMLParser):
         if tag in {"article", "main"}:
             self.scope = max(0, self.scope - 1)
         if tag == self.capture:
-            text = " ".join("".join(self.parts).split())
-            if tag == "h1":
-                self.headings.append(text)
-                self.h1_headings.append(text)
-            elif len(text) >= 50 and not re.search(r"cookies|privacy policy|sign up|subscribe|all rights reserved", text, re.I):
-                self.paragraphs.append(text)
-            self.capture = None
+            self._flush_capture()
+        elif self.capture == "h1" and tag in {"header", "section", "article", "main", "div"}:
+            self._flush_capture()
 
     def handle_data(self, data):
         if self.json_parts is not None:
             self.json_parts.append(data)
         if self.capture and not self.skip:
             self.parts.append(data)
+
+    def _add_schema_image(self, value) -> None:
+        if isinstance(value, str) and value.strip():
+            self.schema_images.append(value.strip())
+        elif isinstance(value, dict):
+            for key in ("url", "contentUrl"):
+                if isinstance(value.get(key), str) and value[key].strip():
+                    self.schema_images.append(value[key].strip())
+        elif isinstance(value, list):
+            for item in value:
+                self._add_schema_image(item)
 
     def _schema(self, node):
         if isinstance(node, list):
@@ -339,8 +496,31 @@ class ArticleEvidence(HTMLParser):
                     self.dates.append(node["datePublished"])
                 if isinstance(node.get("headline"), str):
                     self.headings.append(node["headline"])
+                if "image" in node:
+                    self._add_schema_image(node["image"])
+                if "thumbnailUrl" in node:
+                    self._add_schema_image(node["thumbnailUrl"])
+            elif isinstance(types, list) and "ImageObject" in types:
+                self._add_schema_image(node)
             if "@graph" in node:
                 self._schema(node["@graph"])
+
+
+def collect_article_images(parser: ArticleEvidence, base_url: str, max_urls: int = 8) -> list[str]:
+    """Resolve and prioritize verified HTTPS image URLs embedded in the official article."""
+    meta_rank = {"og:image:secure_url": 0, "og:image": 1, "twitter:image": 2, "twitter:image:src": 3}
+    ordered_meta = [url for _, url in sorted(parser.meta_images, key=lambda pair: meta_rank.get(pair[0], 9))]
+    raw_candidates = ordered_meta + parser.schema_images + parser.article_images
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        full_url = urljoin(base_url, raw.strip())
+        if full_url not in seen and approved_image_url(full_url):
+            seen.add(full_url)
+            resolved.append(full_url)
+            if len(resolved) >= max_urls:
+                break
+    return resolved
 
 
 def _words(text: str) -> list[str]:
@@ -423,9 +603,11 @@ def verify_article(story: dict, contact: str, now: datetime, max_age_hours: int,
             f"(not a live retailer quote): {price['quote']}"
         )
     paragraphs = labeled_prices + [p for p in paragraphs if p not in priced_quotes]
+    image_urls = collect_article_images(parser, final_url)
     return {
         "source_url": final_url, "published": published,
         "paragraphs": paragraphs[:12], "summary": "", "content_blocks": [],
+        "image_urls": image_urls,
         "price_evidence": prices,
         "verification": {
             "checked_at": datetime.now(timezone.utc).isoformat(), "article_url": final_url,

@@ -87,6 +87,45 @@ class CardGeneratorTests(unittest.TestCase):
                 cover_bytes.append(slides[0].read_bytes())
             self.assertEqual(len(set(cover_bytes)), len(cg.CARD_THEMES))
 
+    def test_carousel_uses_source_images_and_adapts_layout_without_error(self):
+        hero_landscape = Image.new("RGB", (1600, 900), (24, 92, 168))
+        chart_rgba = Image.new("RGBA", (1400, 900), (240, 244, 248, 220))
+        wide_banner = Image.new("RGB", (2400, 800), (220, 86, 48))
+
+        rich_topic = {
+            **self.topic,
+            "source": "Apple",
+            "topic_tag": "Mobile Phones",
+            "paragraphs": [
+                "Apple unveiled the next-generation neural engine with 2.4x faster on-device inference.",
+                "Updated camera pipelines improve low-light dynamic range across all pro models.",
+                "Battery optimization delivers 18% longer video playback in real-world testing.",
+                "Available globally starting next Friday with updated developer SDK support.",
+            ],
+            "discussion_prompt": "Which hardware upgrade makes the biggest difference for daily use?",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            slides = cg.render_news_carousel(
+                rich_topic,
+                Path(tmpdir) / "apple_photos",
+                max_slides=5,
+                stem="apple",
+                source_images=[hero_landscape, chart_rgba],
+            )
+            self.assertGreaterEqual(len(slides), 3)
+            for slide in slides:
+                with Image.open(slide) as img:
+                    self.assertEqual((img.format, img.size, img.mode), ("JPEG", (1080, 1350), "RGB"))
+
+            chosen, _, _, _, _, _ = cg._select_theme_and_palette(
+                rich_topic, None, cg._coerce_source_images([wide_banner], rich_topic)
+            )
+            self.assertNotEqual(chosen, "full_bleed_hero")
+
+            # Legacy theme aliases stay supported cleanly.
+            legacy_out = cg.render_news_card(rich_topic, Path(tmpdir) / "legacy.jpg", theme="dark_duotone", source_images=[hero_landscape])
+            self.assertTrue(legacy_out.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

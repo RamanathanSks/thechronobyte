@@ -832,6 +832,44 @@ class DailyThreadsPostTests(unittest.TestCase):
         self.assertGreaterEqual(len(uploaded_urls), 3)
         self.assertTrue(all(u.startswith("https://i.ibb.co/demo/") for u in uploaded_urls))
 
+    def test_prepare_source_images_downloads_filters_and_deduplicates(self):
+        import io
+        from PIL import Image, ImageDraw
+
+        def jpeg_bytes(size, color, stripe=False):
+            img = Image.new("RGB", size, color)
+            if stripe:
+                d = ImageDraw.Draw(img)
+                d.rectangle((0, 0, size[0] // 2, size[1]), fill=(255, 255, 255))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG")
+            return buf.getvalue()
+
+        hero_bytes = jpeg_bytes((1200, 800), (20, 80, 180), stripe=True)
+        tiny_bytes = jpeg_bytes((180, 120), (200, 40, 40))
+        second_bytes = jpeg_bytes((1000, 1000), (16, 150, 90))
+        topic = {
+            **self.topic,
+            "image_urls": [
+                "https://blogs.nvidia.com/hero.jpg",
+                "https://blogs.nvidia.com/hero-copy.jpg",
+                "https://blogs.nvidia.com/tiny.jpg",
+                "https://blogs.nvidia.com/chart.jpg",
+            ],
+            "feed_image_urls": ["https://blogs.nvidia.com/feed.jpg"],
+        }
+        side_effects = [
+            (hero_bytes, "https://blogs.nvidia.com/hero.jpg", "image/jpeg"),
+            (hero_bytes, "https://blogs.nvidia.com/hero-copy.jpg", "image/jpeg"),
+            (tiny_bytes, "https://blogs.nvidia.com/tiny.jpg", "image/jpeg"),
+            (second_bytes, "https://blogs.nvidia.com/chart.jpg", "image/jpeg"),
+        ]
+        with patch.object(bot, "fetch_image_bytes", side_effect=side_effects):
+            imgs = bot._prepare_source_images(topic, max_images=2)
+        self.assertEqual(len(imgs), 2)
+        self.assertEqual(imgs[0]["image"].size, (1200, 800))
+        self.assertEqual(imgs[1]["image"].size, (1000, 1000))
+
 
 if __name__ == "__main__":
     unittest.main()

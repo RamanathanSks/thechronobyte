@@ -292,6 +292,71 @@ class SourceChecks(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(bot._pick_topic_tag({"source": source, "text": title}), expected)
 
+    def test_verify_article_extracts_article_and_meta_images_skipping_chrome(self):
+        html = self.page(
+            extra=(
+                '<meta property="og:image" content="https://blogs.nvidia.com/hero.jpg">'
+                '<script type="application/ld+json">'
+                '{"@type":"NewsArticle","image":{"url":"https://cdn.nvidia.com/schema-hero.png"}}'
+                '</script>'
+            ),
+            body=(
+                '</p><img src="https://blogs.nvidia.com/inline-1.webp" width="1200" height="800">'
+                '<img src="https://blogs.nvidia.com/avatar.jpg" width="48" height="48">'
+                '<img src="https://blogs.nvidia.com/icon.svg">'
+                '<p>Detailed technical announcement with verified visual benchmarks and specs.'
+            ),
+        )
+        result = self.verify(html)
+        self.assertEqual(
+            result["image_urls"],
+            [
+                "https://blogs.nvidia.com/hero.jpg",
+                "https://cdn.nvidia.com/schema-hero.png",
+                "https://blogs.nvidia.com/inline-1.webp",
+            ],
+        )
+
+    def test_verify_article_handles_unclosed_h1_before_article_paragraphs(self):
+        html = (
+            f"<html><head><title>{self.story['text']}</title></head><body><main>"
+            f"<header><h1>{self.story['text']}</header>"
+            f"<article><p>{self.body}</p></article></main></body></html>"
+        ).encode()
+        result = self.verify(html)
+        self.assertEqual(result["paragraphs"], [self.body])
+
+    def test_approved_image_url_and_fetch_image_bytes_enforce_safety(self):
+        for bad in (
+            "http://cdn.example.com/a.jpg",
+            "https://localhost/a.jpg",
+            "https://127.0.0.1/a.jpg",
+            "https://192.168.1.10/a.jpg",
+            "https://cdn.example.com/favicon.ico",
+            "https://cdn.example.com/diagram.svg",
+            "https://user:pass@cdn.example.com/a.jpg",
+        ):
+            with self.subTest(bad=bad):
+                self.assertFalse(news.approved_image_url(bad))
+
+        self.assertTrue(news.approved_image_url("https://assets.claude.com/hero.jpg?w=1920"))
+
+        with patch.object(
+            news.requests,
+            "get",
+            return_value=self.response(body=b"<html>not image</html>", **{"Content-Type": "text/html"}),
+        ):
+            with self.assertRaisesRegex(ValueError, "raster image"):
+                news.fetch_image_bytes("https://assets.claude.com/hero.jpg", "test")
+
+        redirects = [
+            self.response(302, Location="https://images.ctfassets.net/real.jpg"),
+            self.response(body=b"JPEGDATA", **{"Content-Type": "image/jpeg"}),
+        ]
+        with patch.object(news.requests, "get", side_effect=redirects):
+            raw, final_url, mime = news.fetch_image_bytes("https://www.notion.com/hero.jpg", "test")
+        self.assertEqual((raw, final_url, mime), (b"JPEGDATA", "https://images.ctfassets.net/real.jpg", "image/jpeg"))
+
 
 if __name__ == "__main__":
     unittest.main()
