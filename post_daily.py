@@ -24,7 +24,7 @@ from news_sources import (
     NEWS_FEEDS, SOURCE_CATEGORIES, PRICE_PATTERN, RUMOR_PATTERN,
     NEWSROOM_PATHS, REQUIRES_TECH_MATCH,
     fetch_source, feed_items, parse_date, verify_article, load_newsroom, approved_url,
-    approved_image_url, fetch_image_bytes,
+    approved_image_url, fetch_image_bytes, enrich_theme_from_stylesheets,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -79,6 +79,8 @@ MAX_SOURCE_IMAGES = 3
 MEDIA_CONTENT_TAG = "{http://search.yahoo.com/mrss/}content"
 MEDIA_THUMBNAIL_TAG = "{http://search.yahoo.com/mrss/}thumbnail"
 HTTP_TIMEOUT = (5, 20)  # Connect and read timeouts, in seconds.
+PUBLISH_HTTP_TIMEOUT = (10, 60)  # Meta publish endpoints frequently take 20-40s.
+IG_CAROUSEL_ITEM_DELAY = 1.5  # Gentle pacing between child containers reduces Meta spam heuristics.
 URL_PATTERN = re.compile(r"https?://\S+|\b(?:[\w-]+\.)+[a-z]{2,}(?:/\S*)?", re.I)
 USER_ID_PATTERN = re.compile(r"^(?:me|\d{1,30})$")
 VALID_REPLY_CONTROLS = frozenset({
@@ -359,6 +361,28 @@ def _prepare_source_images(topic: dict, contact: str = "local preview", max_imag
         time.monotonic() - started,
     )
     return prepared
+
+
+def _prepare_source_theme(topic: dict, contact: str = "local preview") -> dict:
+    """Enrich scraped HTML theme tokens with up to 2 approved same-domain stylesheets."""
+    raw_theme = topic.get("source_theme")
+    if not isinstance(raw_theme, dict):
+        return {}
+    host = str(topic.get("allowed_host") or "").strip()
+    if not host or not raw_theme.get("stylesheet_urls"):
+        return raw_theme
+    started = time.monotonic()
+    enriched = enrich_theme_from_stylesheets(raw_theme, host, contact, max_sheets=2)
+    topic["source_theme"] = enriched
+    LOGGER.info(
+        "[2/6 Theme] Scraped live source theme | polarity=%s | accents=%d | backgrounds=%d | font=%s | %.2fs",
+        enriched.get("polarity") or "auto",
+        len(enriched.get("accents") or []),
+        len(enriched.get("backgrounds") or []),
+        enriched.get("font_hint") or "auto",
+        time.monotonic() - started,
+    )
+    return enriched
 
 
 def _post_weight(text: str) -> int:
@@ -1196,20 +1220,67 @@ def post_to_threads(
     _wait_for_container(str(creation_id), access_token)
 
     LOGGER.info("[6/6 Threads] Publishing container ID=%s...", creation_id)
-    publish_resp = requests.post(
-        f"{THREADS_API_BASE}/{user_id}/threads_publish",
-        data={
-            "creation_id": str(creation_id),
-            "access_token": access_token,
-        },
-        timeout=HTTP_TIMEOUT,
-    )
-    publish_resp.raise_for_status()
-    post_id = publish_resp.json().get("id")
-    if not post_id:
-        raise ValueError("Threads did not return a post ID; check Threads before retrying.")
-    LOGGER.info("[6/6 Threads] Published post ID=%s (HTTP %s).", post_id, publish_resp.status_code)
-    return str(post_id)
+    try:
+        publish_resp = requests.post(
+            f"{THREADS_API_BASE}/{user_id}/threads_publish",
+            data={
+                "creation_id": str(creation_id),
+                "access_token": access_token,
+            },
+            timeout=PUBLISH_HTTP_TIMEOUT,
+        )
+        publish_resp.raise_for_status()
+        post_id = publish_resp.json().get("id")
+        if not post_id:
+            raise ValueError("Threads did not return a post ID; check Threads before retrying.")
+        LOGGER.info("[6/6 Threads] Published post ID=%s (HTTP %s).", post_id, publish_resp.status_code)
+        return str(post_id)
+    except requests.Timeout:
+        # Never retry threads_publish blindly (can double-post); check whether Meta published server-side.
+        recovered = _verify_threads_publish_after_timeout(user_id, access_token, str(creation_id), post_text)
+        if recovered:
+            LOGGER.warning(
+                "[6/6 Threads] threads_publish timed out waiting for HTTP response, but verified post is LIVE (ID=%s).",
+                recovered,
+            )
+            return recovered
+        raise
+
+
+def _verify_threads_publish_after_timeout(
+    user_id: str,
+    access_token: str,
+    creation_id: str,
+    post_text: str,
+) -> str | None:
+    """Confirm whether a timed-out Threads container actually finished publishing on Meta's side."""
+    try:
+        status_resp = requests.get(
+            f"{THREADS_API_BASE}/{creation_id}",
+            params={"fields": "status"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        status_resp.raise_for_status()
+        status = str(status_resp.json().get("status") or "").upper()
+        if status != "PUBLISHED":
+            return None
+        # Best-effort lookup of the published thread ID from recent posts.
+        probe = post_text.strip().lower()[:45]
+        recent = requests.get(
+            f"{THREADS_API_BASE}/{user_id}/threads",
+            params={"fields": "id,text", "limit": "5"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if recent.status_code == 200:
+            for item in recent.json().get("data", []):
+                if isinstance(item, dict) and probe and probe in str(item.get("text") or "").lower():
+                    if item.get("id"):
+                        return str(item["id"])
+        return creation_id
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return None
 
 
 def publish_thread(posts: list[str], link_url: str, topic_tag: str | None = None) -> list[str]:
@@ -1416,23 +1487,119 @@ def _create_instagram_container(
     return str(creation_id)
 
 
-def _publish_instagram_container(user_id: str, access_token: str, creation_id: str) -> str:
+def _is_ig_ghost_publish_error(error: requests.HTTPError) -> bool:
+    """Detect Meta's code=4 / subcode=2207051 response that often occurs despite a live publish."""
+    if error.response is None or error.response.status_code not in {400, 403}:
+        return False
+    try:
+        payload = error.response.json()
+    except ValueError:
+        return False
+    err = payload.get("error") if isinstance(payload, dict) else None
+    return isinstance(err, dict) and err.get("code") == 4 and err.get("error_subcode") == 2207051
+
+
+def _verify_instagram_publish(
+    user_id: str,
+    access_token: str,
+    creation_id: str,
+    caption: str = "",
+) -> str | None:
+    """Check whether an Instagram container/caption actually went live after a ghost-publish error or timeout."""
+    time.sleep(4.0)
+    published_status = False
+    try:
+        status_resp = requests.get(
+            f"{INSTAGRAM_API_BASE}/{creation_id}",
+            params={"fields": "status_code,status"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if status_resp.status_code == 200:
+            payload = status_resp.json()
+            code = str(payload.get("status_code") or payload.get("status") or "").upper()
+            published_status = code == "PUBLISHED"
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+
+    # Check the account's recent live feed for a matching post published in the last 15 minutes.
+    needle = _clean_text(caption.splitlines()[0] if caption else "").lower()[:45]
+    now = datetime.now(timezone.utc)
+    try:
+        media_resp = requests.get(
+            f"{INSTAGRAM_API_BASE}/{user_id}/media",
+            params={"fields": "id,caption,timestamp", "limit": "5"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if media_resp.status_code == 200:
+            for item in media_resp.json().get("data", []):
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                ts_raw = str(item.get("timestamp") or "")
+                recent_ok = True
+                if ts_raw:
+                    try:
+                        ts = parse_date(ts_raw)
+                        recent_ok = abs((now - ts).total_seconds()) <= 900
+                    except (ValueError, TypeError):
+                        recent_ok = True
+                item_caption = _clean_text(str(item.get("caption") or "")).lower()
+                if recent_ok and needle and needle in item_caption:
+                    return str(item["id"])
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+
+    return creation_id if published_status else None
+
+
+def _publish_instagram_container(
+    user_id: str,
+    access_token: str,
+    creation_id: str,
+    caption: str = "",
+) -> str:
     """Publish a prepared Instagram single or carousel container via /media_publish."""
     LOGGER.info("[6/6 Instagram] Publishing container ID=%s via media_publish...", creation_id)
-    publish_resp = requests.post(
-        f"{INSTAGRAM_API_BASE}/{user_id}/media_publish",
-        data={
-            "creation_id": str(creation_id),
-            "access_token": access_token,
-        },
-        timeout=HTTP_TIMEOUT,
-    )
-    publish_resp.raise_for_status()
-    media_id = publish_resp.json().get("id")
-    if not media_id:
-        raise ValueError("Instagram did not return a media ID; check Instagram before retrying.")
-    LOGGER.info("[6/6 Instagram] Published media ID=%s (HTTP %s).", media_id, publish_resp.status_code)
-    return str(media_id)
+    try:
+        publish_resp = requests.post(
+            f"{INSTAGRAM_API_BASE}/{user_id}/media_publish",
+            data={
+                "creation_id": str(creation_id),
+                "access_token": access_token,
+            },
+            timeout=PUBLISH_HTTP_TIMEOUT,
+        )
+        publish_resp.raise_for_status()
+        media_id = publish_resp.json().get("id")
+        if not media_id:
+            raise ValueError("Instagram did not return a media ID; check Instagram before retrying.")
+        LOGGER.info("[6/6 Instagram] Published media ID=%s (HTTP %s).", media_id, publish_resp.status_code)
+        return str(media_id)
+    except requests.HTTPError as error:
+        if _is_ig_ghost_publish_error(error):
+            recovered = _verify_instagram_publish(user_id, access_token, str(creation_id), caption=caption)
+            if recovered:
+                LOGGER.warning(
+                    "[6/6 Instagram] Meta returned code=4/subcode=2207051 (ghost-publish warning), "
+                    "but verified post is LIVE on Instagram (media ID=%s).",
+                    recovered,
+                )
+                return recovered
+            raise ValueError(
+                "Instagram media_publish blocked with Meta subcode=2207051 (anti-spam integrity filter) "
+                "and post was not found on the feed. Check Instagram App -> Settings -> Account Status."
+            ) from error
+        raise
+    except requests.Timeout:
+        recovered = _verify_instagram_publish(user_id, access_token, str(creation_id), caption=caption)
+        if recovered:
+            LOGGER.warning(
+                "[6/6 Instagram] media_publish timed out, but verified post is LIVE on Instagram (media ID=%s).",
+                recovered,
+            )
+            return recovered
+        raise
 
 
 def post_to_instagram(image_url: str, caption: str) -> str:
@@ -1457,7 +1624,7 @@ def post_to_instagram(image_url: str, caption: str) -> str:
         {"image_url": image_url, "caption": caption},
         label="photo",
     )
-    return _publish_instagram_container(user_id, access_token, creation_id)
+    return _publish_instagram_container(user_id, access_token, creation_id, caption=caption)
 
 
 def post_instagram_carousel(image_urls: list[str], caption: str) -> str:
@@ -1491,6 +1658,8 @@ def post_instagram_carousel(image_urls: list[str], caption: str) -> str:
             label=f"carousel-item {idx}/{len(image_urls)}",
         )
         child_ids.append(child_id)
+        if idx < len(image_urls) and IG_CAROUSEL_ITEM_DELAY > 0:
+            time.sleep(IG_CAROUSEL_ITEM_DELAY)
 
     parent_id = _create_instagram_container(
         user_id,
@@ -1502,7 +1671,7 @@ def post_instagram_carousel(image_urls: list[str], caption: str) -> str:
         },
         label="CAROUSEL parent",
     )
-    return _publish_instagram_container(user_id, access_token, parent_id)
+    return _publish_instagram_container(user_id, access_token, parent_id, caption=caption)
 
 
 def _fetch_instagram_permalink(media_id: str) -> str | None:
@@ -1533,8 +1702,10 @@ def publish_instagram_card(topic: dict, caption: str, source_images: list[dict] 
     """Render dynamic multi-slide 1080x1350 carousel cards, upload to HTTPS host, and publish to Instagram."""
     from card_generator import render_news_card, render_news_carousel
 
+    contact = _contact_label()
+    _prepare_source_theme(topic, contact=contact)
     if source_images is None:
-        source_images = _prepare_source_images(topic, contact=_contact_label())
+        source_images = _prepare_source_images(topic, contact=contact)
 
     slug = hashlib.sha256(topic["source_url"].encode("utf-8")).hexdigest()[:8]
     stem = f"{topic['published']:%Y%m%d}-{slug}"
@@ -1695,7 +1866,9 @@ def main(argv: list[str] | None = None) -> int:
             if topic is None:
                 LOGGER.info("Pipeline completed in %.2fs (no story to save).", time.monotonic() - started)
                 return 0
-            source_images = _prepare_source_images(topic, contact=_contact_label())
+            contact = _contact_label()
+            _prepare_source_theme(topic, contact=contact)
+            source_images = _prepare_source_images(topic, contact=contact)
             topic["downloaded_image_count"] = len(source_images)
             target = Path(args[1])
             slides = render_news_carousel(
@@ -1749,7 +1922,12 @@ def main(argv: list[str] | None = None) -> int:
         posts = generate_thread(topic) if enable_threads == "true" else []
         topic_tag = topic.get("topic_tag") or _pick_topic_tag(topic)
         ig_caption = generate_instagram_caption(topic) if enable_instagram == "true" else ""
-        source_images = _prepare_source_images(topic, contact=_contact_label()) if enable_instagram == "true" else []
+        if enable_instagram == "true":
+            contact = _contact_label()
+            _prepare_source_theme(topic, contact=contact)
+            source_images = _prepare_source_images(topic, contact=contact)
+        else:
+            source_images = []
         topic["downloaded_image_count"] = len(source_images)
 
         if dry_run == "true":

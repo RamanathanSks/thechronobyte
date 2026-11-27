@@ -326,6 +326,32 @@ class SourceChecks(unittest.TestCase):
         result = self.verify(html)
         self.assertEqual(result["paragraphs"], [self.body])
 
+    def test_verify_article_scrapes_live_source_theme_and_stylesheets(self):
+        html = self.page(
+            extra=(
+                '<meta name="theme-color" content="#141413">'
+                '<link rel="stylesheet" href="/assets/brand.css">'
+                '<link rel="stylesheet" href="https://evil.example/bad.css">'
+                '<style>:root{--brand-accent:#76b900;font-family:Georgia,serif;}</style>'
+            )
+        )
+        result = self.verify(html)
+        theme = result["source_theme"]
+        self.assertEqual(theme["polarity"], "dark")
+        self.assertIn([118, 185, 0], theme["accents"])
+        self.assertEqual(theme["font_hint"], "serif")
+        self.assertEqual(theme["stylesheet_urls"], ["https://blogs.nvidia.com/assets/brand.css"])
+
+        css_resp = self.response(body=b":root{--primary-color:#e05a2b;background-color:#121318;}")
+        with patch.object(news.requests, "get", return_value=css_resp):
+            enriched = news.enrich_theme_from_stylesheets(
+                {"polarity": "", "accents": [], "backgrounds": [], "font_hint": "", "stylesheet_urls": theme["stylesheet_urls"]},
+                "blogs.nvidia.com",
+                "test",
+            )
+        self.assertIn([224, 90, 43], enriched["accents"])
+        self.assertEqual(enriched["polarity"], "dark")
+
     def test_approved_image_url_and_fetch_image_bytes_enforce_safety(self):
         for bad in (
             "http://cdn.example.com/a.jpg",

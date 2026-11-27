@@ -117,13 +117,33 @@ class CardGeneratorTests(unittest.TestCase):
                 with Image.open(slide) as img:
                     self.assertEqual((img.format, img.size, img.mode), ("JPEG", (1080, 1350), "RGB"))
 
-            chosen, _, _, _, _, _ = cg._select_theme_and_palette(
-                rich_topic, None, cg._coerce_source_images([wide_banner], rich_topic)
+            spec = cg._compose_post_template(
+                rich_topic, cg._coerce_source_images([wide_banner], rich_topic), None, cg._topic_seed(rich_topic)
             )
-            self.assertNotEqual(chosen, "full_bleed_hero")
+            self.assertNotEqual(spec["layout"], "full_bleed_hero")
+
+            # No static pre-defined company palette table; palettes come live from source CSS & photos.
+            self.assertFalse(hasattr(cg, "SOURCE_PALETTES"))
+            css_theme = {
+                "polarity": "dark",
+                "accents": [[230, 88, 42], [68, 196, 152]],
+                "backgrounds": [[20, 20, 19]],
+                "font_hint": "serif",
+            }
+            live_pal = cg._resolve_live_palette(cg._coerce_source_images([hero_landscape], rich_topic), css_theme, 42)
+            self.assertEqual(live_pal["origin"], "scraped_css+source_photo")
+            photo_only_pal = cg._resolve_live_palette(cg._coerce_source_images([wide_banner], rich_topic), None, 42)
+            self.assertEqual(photo_only_pal["origin"], "source_photo")
+            self.assertNotEqual(live_pal["accent"], photo_only_pal["accent"])
 
             # Legacy theme aliases stay supported cleanly.
-            legacy_out = cg.render_news_card(rich_topic, Path(tmpdir) / "legacy.jpg", theme="dark_duotone", source_images=[hero_landscape])
+            legacy_out = cg.render_news_card(
+                rich_topic,
+                Path(tmpdir) / "legacy.jpg",
+                theme="dark_duotone",
+                source_images=[hero_landscape],
+                source_theme=css_theme,
+            )
             self.assertTrue(legacy_out.is_file())
 
 

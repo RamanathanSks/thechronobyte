@@ -11,6 +11,7 @@ import logging
 import re
 import unicodedata
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -86,6 +87,18 @@ AMOUNT_PATTERN = re.compile(r"(?:US\$|AU\$|CA\$|USD|INR|EUR|GBP|AUD|CAD|JPY|Rs\.
 ATOM = "{http://www.w3.org/2005/Atom}"
 MAX_BYTES = 4_000_000
 MAX_IMAGE_BYTES = 8_000_000
+MAX_CSS_BYTES = 350_000
+_HEX_COLOR_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
+_RGB_COLOR_RE = re.compile(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*[\d.]+)?\s*\)", re.I)
+_CSS_ACCENT_VAR_RE = re.compile(
+    r"--[a-z0-9_-]*(?:accent|brand|primary|highlight|theme|link|cta|tint|fill)[a-z0-9_-]*\s*:\s*([^;}{]+)",
+    re.I,
+)
+_CSS_BG_DECL_RE = re.compile(
+    r"(?:--[a-z0-9_-]*(?:bg|background|surface|canvas)[a-z0-9_-]*|background(?:-color)?)\s*:\s*([^;}{]+)",
+    re.I,
+)
+_FONT_FAMILY_RE = re.compile(r"font-family\s*:\s*([^;}{]+)", re.I)
 _NON_PHOTO_IMAGE = re.compile(
     r"(?:favicon|apple-touch-icon|/(?:icons?|avatars?|logos?|badges?|sprites?)/|"
     r"(?:^|[/_-])(?:logo|avatar|icon|badge|sprite|pixel|spacer|placeholder)[._-]|"
@@ -375,14 +388,18 @@ def _parse_dim(value: str | None) -> int | None:
 
 
 class ArticleEvidence(HTMLParser):
-    """Read page headings, publication metadata, paragraphs and media inside main/article."""
+    """Read page headings, publication metadata, paragraphs, media, and theme tokens inside main/article."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.headings, self.paragraphs, self.dates, self.canonicals = [], [], [], []
         self.h1_headings = []
         self.meta_images, self.schema_images, self.article_images = [], [], []
+        self.theme_colors, self.color_schemes, self.stylesheet_urls = [], [], []
+        self.inline_css_parts: list[str] = []
+        self.svg_colors: list[str] = []
         self.scope = self.skip = 0
+        self.in_style = False
         self.capture = None
         self.parts = []
         self.json_parts = None
@@ -391,10 +408,20 @@ class ArticleEvidence(HTMLParser):
         attrs = dict(attrs)
         if tag == "script" and attrs.get("type") == "application/ld+json":
             self.json_parts = []
+        if tag == "style":
+            self.in_style = True
         if tag in {"nav", "footer", "aside", "script", "style", "form", "noscript"}:
             self.skip += 1
         if tag in {"article", "main"}:
             self.scope += 1
+        inline_style = attrs.get("style", "")
+        if inline_style and len(self.inline_css_parts) < 120:
+            self.inline_css_parts.append(inline_style[:400])
+        if tag in {"path", "rect", "circle", "polygon", "svg"} and len(self.svg_colors) < 80:
+            for attr_name in ("fill", "stroke"):
+                val = (attrs.get(attr_name) or "").strip()
+                if val.startswith("#") or val.lower().startswith("rgb"):
+                    self.svg_colors.append(val)
         if tag == "meta":
             key = (attrs.get("property") or attrs.get("name", "")).lower()
             value = attrs.get("content", "")
@@ -404,8 +431,17 @@ class ArticleEvidence(HTMLParser):
                 self.dates.append(value)
             if key in {"og:image:secure_url", "og:image", "twitter:image", "twitter:image:src"} and value:
                 self.meta_images.append((key, value.strip()))
-        if tag == "link" and attrs.get("rel") == "canonical":
-            self.canonicals.append(attrs.get("href", ""))
+            if key in {"theme-color", "msapplication-tilecolor"} and value:
+                self.theme_colors.append(value.strip())
+            if key == "color-scheme" and value:
+                self.color_schemes.append(value.strip().lower())
+        if tag == "link":
+            rel_tokens = set((attrs.get("rel") or "").lower().split())
+            href = (attrs.get("href") or "").strip()
+            if "canonical" in rel_tokens and href:
+                self.canonicals.append(href)
+            if "stylesheet" in rel_tokens and href and len(self.stylesheet_urls) < 6:
+                self.stylesheet_urls.append(href)
         if not self.skip and self.scope and tag in {"img", "source"}:
             if tag == "source":
                 media_type = (attrs.get("type") or "").lower()
@@ -452,6 +488,8 @@ class ArticleEvidence(HTMLParser):
         self.parts = []
 
     def handle_endtag(self, tag):
+        if tag == "style":
+            self.in_style = False
         if tag == "script" and self.json_parts is not None:
             try:
                 self._schema(json.loads("".join(self.json_parts)))
@@ -468,6 +506,8 @@ class ArticleEvidence(HTMLParser):
             self._flush_capture()
 
     def handle_data(self, data):
+        if self.in_style and len(self.inline_css_parts) < 120:
+            self.inline_css_parts.append(data[:8000])
         if self.json_parts is not None:
             self.json_parts.append(data)
         if self.capture and not self.skip:
@@ -500,10 +540,186 @@ class ArticleEvidence(HTMLParser):
                     self._add_schema_image(node["image"])
                 if "thumbnailUrl" in node:
                     self._add_schema_image(node["thumbnailUrl"])
-            elif isinstance(types, list) and "ImageObject" in types:
-                self._add_schema_image(node)
             if "@graph" in node:
                 self._schema(node["@graph"])
+
+
+def _parse_rgb_token(token: str) -> tuple[int, int, int] | None:
+    """Parse #rgb, #rrggbb, or rgb(r,g,b) into an (R, G, B) tuple."""
+    text = token.strip()
+    m_hex = _HEX_COLOR_RE.search(text)
+    if m_hex:
+        h = m_hex.group(0)[1:]
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    m_rgb = _RGB_COLOR_RE.search(text)
+    if m_rgb:
+        vals = tuple(int(m_rgb.group(i)) for i in (1, 2, 3))
+        if all(0 <= v <= 255 for v in vals):
+            return vals
+    return None
+
+
+def _color_chroma(rgb: tuple[int, int, int]) -> int:
+    return max(rgb) - min(rgb)
+
+
+def _color_luma(rgb: tuple[int, int, int]) -> float:
+    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+
+
+def parse_css_theme_tokens(css_text: str) -> dict:
+    """Extract chromatic accents, dark/light surfaces, and serif/sans hints from raw CSS."""
+    accent_counts: Counter[tuple[int, int, int]] = Counter()
+    bg_counts: Counter[tuple[int, int, int]] = Counter()
+
+    for match in _CSS_ACCENT_VAR_RE.finditer(css_text):
+        rgb = _parse_rgb_token(match.group(1))
+        if rgb and _color_chroma(rgb) >= 32:
+            accent_counts[rgb] += 4
+
+    for match in _CSS_BG_DECL_RE.finditer(css_text):
+        rgb = _parse_rgb_token(match.group(1))
+        if rgb:
+            bg_counts[rgb] += 2
+
+    for match in _HEX_COLOR_RE.finditer(css_text[:200_000]):
+        rgb = _parse_rgb_token(match.group(0))
+        if rgb and _color_chroma(rgb) >= 36:
+            accent_counts[rgb] += 1
+
+    serif_hits = 0
+    sans_hits = 0
+    for match in _FONT_FAMILY_RE.finditer(css_text[:200_000]):
+        val = match.group(1).lower()
+        if any(k in val for k in ("georgia", "garamond", "times", "merriweather", "playfair", "tiempos", "newsreader", "serif")) and "sans-serif" not in val:
+            serif_hits += 1
+        elif any(k in val for k in ("inter", "helvetica", "arial", "sf pro", "roboto", "sans-serif", "segoe", "geist", "sohne")):
+            sans_hits += 1
+
+    font_hint = ""
+    if serif_hits > sans_hits and serif_hits > 0:
+        font_hint = "serif"
+    elif sans_hits > 0:
+        font_hint = "sans"
+
+    return {
+        "accents": [list(rgb) for rgb, _ in accent_counts.most_common(6)],
+        "backgrounds": [list(rgb) for rgb, _ in bg_counts.most_common(4)],
+        "font_hint": font_hint,
+    }
+
+
+def extract_source_theme(parser: ArticleEvidence, base_url: str, allowed_host: str) -> dict:
+    """Build a structured live theme summary directly from the verified source HTML."""
+    meta_rgbs = [rgb for raw in parser.theme_colors if (rgb := _parse_rgb_token(raw)) is not None]
+    css_blob = "\n".join(parser.inline_css_parts)
+    parsed_css = parse_css_theme_tokens(css_blob)
+
+    svg_counts: Counter[tuple[int, int, int]] = Counter()
+    for raw in parser.svg_colors:
+        rgb = _parse_rgb_token(raw)
+        if rgb and _color_chroma(rgb) >= 36:
+            svg_counts[rgb] += 1
+
+    accents: list[list[int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for candidate in (
+        [rgb for rgb in meta_rgbs if _color_chroma(rgb) >= 30]
+        + [tuple(c) for c in parsed_css["accents"]]
+        + [rgb for rgb, _ in svg_counts.most_common(4)]
+    ):
+        if candidate not in seen:
+            seen.add(candidate)
+            accents.append(list(candidate))
+
+    backgrounds: list[list[int]] = []
+    seen_bg: set[tuple[int, int, int]] = set()
+    for candidate in meta_rgbs + [tuple(c) for c in parsed_css["backgrounds"]]:
+        if candidate not in seen_bg:
+            seen_bg.add(candidate)
+            backgrounds.append(list(candidate))
+
+    polarity = ""
+    if any("dark" in cs and "light" not in cs for cs in parser.color_schemes):
+        polarity = "dark"
+    elif meta_rgbs:
+        polarity = "dark" if _color_luma(meta_rgbs[0]) < 115 else "light"
+    elif backgrounds:
+        polarity = "dark" if _color_luma(tuple(backgrounds[0])) < 115 else "light"
+
+    stylesheets: list[str] = []
+    for raw_href in parser.stylesheet_urls:
+        full_url = urljoin(base_url, raw_href)
+        if full_url not in stylesheets and approved_url(full_url, allowed_host):
+            stylesheets.append(full_url)
+
+    return {
+        "polarity": polarity,
+        "accents": accents[:6],
+        "backgrounds": backgrounds[:4],
+        "font_hint": parsed_css["font_hint"],
+        "stylesheet_urls": stylesheets[:3],
+    }
+
+
+def enrich_theme_from_stylesheets(theme: dict, allowed_host: str, contact: str, max_sheets: int = 2) -> dict:
+    """Optionally scrape up to 2 approved same-domain stylesheets to enrich live source colors."""
+    merged = {
+        "polarity": theme.get("polarity", ""),
+        "accents": list(theme.get("accents") or []),
+        "backgrounds": list(theme.get("backgrounds") or []),
+        "font_hint": theme.get("font_hint", ""),
+        "stylesheet_urls": list(theme.get("stylesheet_urls") or []),
+    }
+    if len(merged["accents"]) >= 3 and merged["font_hint"]:
+        return merged
+
+    seen_acc = {tuple(c) for c in merged["accents"]}
+    seen_bg = {tuple(c) for c in merged["backgrounds"]}
+    fetched = 0
+    for url in merged["stylesheet_urls"]:
+        if fetched >= max_sheets or not approved_url(url, allowed_host):
+            continue
+        try:
+            with requests.get(
+                url,
+                headers={"User-Agent": f"DailyTechNewsBot/1.0 ({contact})"},
+                timeout=(3, 5),
+                allow_redirects=False,
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    continue
+                chunks, size = [], 0
+                for chunk in resp.iter_content(32768):
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= MAX_CSS_BYTES:
+                        break
+                css_text = b"".join(chunks).decode("utf-8", errors="ignore")
+            fetched += 1
+            tokens = parse_css_theme_tokens(css_text)
+            for c in tokens["accents"]:
+                tup = tuple(c)
+                if tup not in seen_acc:
+                    seen_acc.add(tup)
+                    merged["accents"].append(c)
+            for c in tokens["backgrounds"]:
+                tup = tuple(c)
+                if tup not in seen_bg:
+                    seen_bg.add(tup)
+                    merged["backgrounds"].append(c)
+            if not merged["font_hint"] and tokens["font_hint"]:
+                merged["font_hint"] = tokens["font_hint"]
+            if not merged["polarity"] and merged["backgrounds"]:
+                merged["polarity"] = "dark" if _color_luma(tuple(merged["backgrounds"][0])) < 115 else "light"
+        except (requests.RequestException, ValueError):
+            continue
+    merged["accents"] = merged["accents"][:6]
+    merged["backgrounds"] = merged["backgrounds"][:4]
+    return merged
 
 
 def collect_article_images(parser: ArticleEvidence, base_url: str, max_urls: int = 8) -> list[str]:
@@ -604,10 +820,12 @@ def verify_article(story: dict, contact: str, now: datetime, max_age_hours: int,
         )
     paragraphs = labeled_prices + [p for p in paragraphs if p not in priced_quotes]
     image_urls = collect_article_images(parser, final_url)
+    source_theme = extract_source_theme(parser, final_url, story["allowed_host"])
     return {
         "source_url": final_url, "published": published,
         "paragraphs": paragraphs[:12], "summary": "", "content_blocks": [],
         "image_urls": image_urls,
+        "source_theme": source_theme,
         "price_evidence": prices,
         "verification": {
             "checked_at": datetime.now(timezone.utc).isoformat(), "article_url": final_url,

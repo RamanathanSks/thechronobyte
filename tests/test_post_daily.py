@@ -790,6 +790,7 @@ class DailyThreadsPostTests(unittest.TestCase):
         with (
             patch.object(bot.requests, "post", side_effect=post_resps) as post,
             patch.object(bot.requests, "get", return_value=self.response({"status_code": "FINISHED"})),
+            patch.object(bot.time, "sleep"),
         ):
             media_id = bot.post_instagram_carousel(urls, "Multi-card breakdown #TheChronoByte")
         self.assertEqual(media_id, "carousel-m-1")
@@ -869,6 +870,72 @@ class DailyThreadsPostTests(unittest.TestCase):
         self.assertEqual(len(imgs), 2)
         self.assertEqual(imgs[0]["image"].size, (1200, 800))
         self.assertEqual(imgs[1]["image"].size, (1000, 1000))
+
+    def test_threads_publish_timeout_recovers_when_container_status_is_published(self):
+        self.credentials()
+        get_resps = [
+            self.response({"status": "FINISHED"}),
+            self.response({"status": "PUBLISHED"}),
+            self.response({"data": [{"id": "live-thread-77", "text": "A confirmed tech update."}]}),
+        ]
+        with (
+            patch.object(bot.requests, "post", side_effect=[self.response({"id": "c-1"}), requests.ReadTimeout]) as post,
+            patch.object(bot.requests, "get", side_effect=get_resps),
+        ):
+            post_id = bot.post_to_threads("A confirmed tech update.", self.topic["source_url"])
+        self.assertEqual(post_id, "live-thread-77")
+        self.assertEqual(post.call_count, 2)  # Never retries threads_publish
+
+    def test_instagram_ghost_publish_subcode_2207051_recovers_verified_live_post(self):
+        os.environ["IG_USER_ID"] = "17841400001234"
+        os.environ["IG_ACCESS_TOKEN"] = "secret-ig-tok"
+        ghost_err = self.response(
+            {"error": {"code": 4, "error_subcode": 2207051, "message": "Application request limit reached"}},
+            status=403,
+        )
+        post_resps = [
+            self.response({"id": "ig-c1"}),
+            ghost_err,
+        ]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        get_resps = [
+            self.response({"status_code": "FINISHED"}),
+            self.response({"status_code": "FINISHED"}),
+            self.response({
+                "data": [{"id": "live-ig-888", "caption": "PlayStation headline\n\nDetails", "timestamp": now_iso}]
+            }),
+        ]
+        with (
+            patch.object(bot.requests, "post", side_effect=post_resps) as post,
+            patch.object(bot.requests, "get", side_effect=get_resps),
+            patch.object(bot.time, "sleep"),
+        ):
+            media_id = bot.post_to_instagram("https://cdn.example.com/card.jpg", "PlayStation headline\n\nDetails")
+        self.assertEqual(media_id, "live-ig-888")
+        self.assertEqual(post.call_count, 2)  # Never retries media_publish
+
+    def test_instagram_subcode_2207051_raises_clear_error_when_not_live(self):
+        os.environ["IG_USER_ID"] = "17841400001234"
+        os.environ["IG_ACCESS_TOKEN"] = "secret-ig-tok"
+        ghost_err = self.response(
+            {"error": {"code": 4, "error_subcode": 2207051, "message": "Application request limit reached"}},
+            status=403,
+        )
+        with (
+            patch.object(bot.requests, "post", side_effect=[self.response({"id": "ig-c1"}), ghost_err]),
+            patch.object(
+                bot.requests,
+                "get",
+                side_effect=[
+                    self.response({"status_code": "FINISHED"}),
+                    self.response({"status_code": "FINISHED"}),
+                    self.response({"data": []}),
+                ],
+            ),
+            patch.object(bot.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(ValueError, "2207051"):
+                bot.post_to_instagram("https://cdn.example.com/card.jpg", "Unpublished caption")
 
 
 if __name__ == "__main__":
